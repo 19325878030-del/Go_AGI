@@ -189,19 +189,34 @@ class FunctionCallAgent:
     "parameters": {{"参数名": "参数值"}}
 }}
 
+重要规则：
+1. 输出工具调用JSON后立即停止，不要输出任何其他内容
+2. 绝对不要自己编造工具的返回结果，结果由系统执行工具后提供
+3. 如果不需要工具，直接用自然语言回答，不要输出JSON
+
 如果需要多个工具，可以分步调用。"""
 
     def _parse_tool_call(self, response: str) -> Dict:
-        """解析工具调用请求"""
-        try:
-            # 尝试提取JSON
-            start = response.find('{')
-            end = response.rfind('}') + 1
-            if start != -1 and end != 0:
-                json_str = response[start:end]
-                return json.loads(json_str)
-        except:
-            pass
+        """
+        解析工具调用请求
+
+        逐个扫描文本中的JSON对象，返回第一个含"tool"字段的对象。
+        小模型常在工具调用JSON后自行编造"工具返回结果"等其他内容，
+        首尾大包围式的提取会整体解析失败，这里必须逐块解析。
+        """
+        decoder = json.JSONDecoder()
+        idx = 0
+        while idx < len(response):
+            start = response.find('{', idx)
+            if start == -1:
+                break
+            try:
+                obj, end = decoder.raw_decode(response[start:])
+                if isinstance(obj, dict) and "tool" in obj:
+                    return obj
+                idx = start + end
+            except json.JSONDecodeError:
+                idx = start + 1
         return None
 
     def _execute_tool(self, tool_name: str, parameters: Dict) -> Any:
@@ -215,13 +230,15 @@ class FunctionCallAgent:
         except Exception as e:
             return f"工具执行错误: {str(e)}"
 
-    def chat(self, user_input: str, max_iterations: int = 3) -> str:
+    def chat(self, user_input: str, max_iterations: int = 3, trace: List[Dict] = None) -> str:
         """
         与Agent对话
 
         Args:
             user_input: 用户输入
             max_iterations: 最大迭代次数
+            trace: 可选列表，每次工具调用会以
+                {"tool": 名称, "parameters": 参数, "result": 结果} 追加进来
 
         Returns:
             Agent的回答
@@ -251,8 +268,18 @@ class FunctionCallAgent:
                 result = self._execute_tool(tool_name, parameters)
                 print(f"📊 结果: {json.dumps(result, ensure_ascii=False)[:200]}...")
 
+                # 记录工具调用轨迹，供Web端展示
+                if trace is not None:
+                    trace.append({
+                        "tool": tool_name,
+                        "parameters": parameters,
+                        "result": result
+                    })
+
                 # 将工具结果添加到对话历史
-                messages.append(assistant_message)
+                # 注意：存入的是解析出的干净JSON指令，而不是模型原文——
+                # 小模型原文里常夹带它自己编造的"工具结果"，混入历史会误导后续轮次
+                messages.append({"role": "assistant", "content": json.dumps(tool_call, ensure_ascii=False)})
                 messages.append({
                     "role": "tool",
                     "content": json.dumps(result, ensure_ascii=False)

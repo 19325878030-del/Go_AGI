@@ -144,6 +144,25 @@ def index():
                 gap: 5px;
                 cursor: pointer;
             }
+            .tool-trace {
+                margin-bottom: 15px;
+                padding: 10px 15px;
+                border-radius: 10px;
+                max-width: 80%;
+                margin-right: auto;
+                background: #f0f4ff;
+                border: 1px dashed #667eea;
+                font-size: 13px;
+                color: #555;
+                line-height: 1.6;
+            }
+            .tool-trace .tool-step {
+                margin: 2px 0;
+            }
+            .tool-trace .tool-name {
+                color: #667eea;
+                font-weight: bold;
+            }
             .loading {
                 display: inline-block;
                 width: 12px;
@@ -165,9 +184,19 @@ def index():
 
             <div class="controls">
                 <label>
-                    <input type="checkbox" id="ragMode" checked>
-                    使用知识库 (RAG)
+                    <input type="radio" name="mode" id="modeAgent" value="agent" checked>
+                    🤖 Agent模式（工具调用）
                 </label>
+                <label>
+                    <input type="radio" name="mode" id="modeRag" value="rag">
+                    📚 RAG模式（知识库）
+                </label>
+                <label>
+                    <input type="radio" name="mode" id="modeLlm" value="llm">
+                    💬 直接对话
+                </label>
+            </div>
+            <div class="controls">
                 <label>
                     温度: <input type="range" id="temperature" min="0" max="2" step="0.1" value="0.7" style="width:100px">
                     <span id="tempDisplay">0.7</span>
@@ -189,10 +218,14 @@ def index():
             const chatBox = document.getElementById('chatBox');
             const userInput = document.getElementById('userInput');
             const sendBtn = document.getElementById('sendBtn');
-            const ragMode = document.getElementById('ragMode');
             const temperature = document.getElementById('temperature');
             const tempDisplay = document.getElementById('tempDisplay');
             const status = document.getElementById('status');
+
+            function getMode() {
+                const checked = document.querySelector('input[name="mode"]:checked');
+                return checked ? checked.value : 'agent';
+            }
 
             let isProcessing = false;
 
@@ -231,7 +264,7 @@ def index():
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
                             message: message,
-                            use_rag: ragMode.checked,
+                            mode: getMode(),
                             temperature: parseFloat(temperature.value)
                         })
                     });
@@ -241,6 +274,10 @@ def index():
                     if (data.error) {
                         addMessage('assistant', '❌ ' + data.error);
                     } else {
+                        // Agent模式下先展示工具调用轨迹，再展示最终回答
+                        if (data.trace && data.trace.length > 0) {
+                            addToolTrace(data.trace);
+                        }
                         addMessage('assistant', data.reply);
                     }
 
@@ -262,6 +299,26 @@ def index():
                 chatBox.appendChild(div);
                 chatBox.scrollTop = chatBox.scrollHeight;
             }
+
+            function addToolTrace(trace) {
+                const div = document.createElement('div');
+                div.className = 'tool-trace';
+                trace.forEach(step => {
+                    const p = document.createElement('div');
+                    p.className = 'tool-step';
+                    const name = document.createElement('span');
+                    name.className = 'tool-name';
+                    name.textContent = '🔧 ' + step.tool;
+                    p.appendChild(name);
+                    p.appendChild(document.createTextNode(
+                        ' (' + JSON.stringify(step.parameters) + ') → ' +
+                        JSON.stringify(step.result).slice(0, 120)
+                    ));
+                    div.appendChild(p);
+                });
+                chatBox.appendChild(div);
+                chatBox.scrollTop = chatBox.scrollHeight;
+            }
         </script>
     </body>
     </html>
@@ -274,18 +331,23 @@ def chat():
     try:
         data = request.json
         message = data.get('message', '')
-        use_rag = data.get('use_rag', True)
+        mode = data.get('mode', 'agent')  # agent / rag / llm
         temperature = data.get('temperature', 0.7)
 
         if not message:
             return jsonify({'error': '请输入问题'})
 
-        # 如果启用RAG，调用RAG系统
-        if use_rag:
+        # 根据前端选择的模式分发
+        if mode == 'rag':
             reply = chat_with_rag(message, temperature)
-        else:
-            reply = chat_with_llm(message, temperature)
+            return jsonify({'reply': reply})
 
+        if mode == 'agent':
+            reply, trace = chat_with_agent(message)
+            return jsonify({'reply': reply, 'trace': trace})
+
+        # 默认直接调用LLM
+        reply = chat_with_llm(message, temperature)
         return jsonify({'reply': reply})
 
     except Exception as e:
@@ -353,6 +415,44 @@ def chat_with_rag(message, temperature):
         print(f"RAG错误: {e}")
         # 降级到普通LLM，保证前端始终有回复
         return chat_with_llm(message, temperature)
+
+
+# ==================== Agent支持 ====================
+# 同样采用懒加载单例：Agent初始化只需注册工具（快），
+# 但保持与RAG一致的模式，首次调用时创建，后续复用
+_agent_instance = None
+
+
+def get_agent():
+    """获取（必要时初始化）FunctionCallAgent单例"""
+    global _agent_instance
+    if _agent_instance is None:
+        from modules.agent.custom_agent import FunctionCallAgent
+
+        _agent_instance = FunctionCallAgent(
+            model_name=MODEL_NAME,
+            ollama_url="http://localhost:11434"
+        )
+    return _agent_instance
+
+
+def chat_with_agent(message):
+    """
+    使用Agent回答（支持天气/计算器/单位转换/搜索等工具调用）
+
+    Returns:
+        (回答文本, 工具调用轨迹列表)
+    """
+    trace = []
+    try:
+        agent = get_agent()
+        reply = agent.chat(message, trace=trace)
+        return reply, trace
+
+    except Exception as e:
+        print(f"Agent错误: {e}")
+        # Agent失败时降级到普通LLM，保证前端始终有回复
+        return chat_with_llm(message, 0.7), trace
 
 
 if __name__ == '__main__':
