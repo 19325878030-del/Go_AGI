@@ -21,6 +21,9 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# 知识库中未检索到相关内容时，直接回答前加的标注
+NOT_FOUND_TAG = "<#未能在标准中找到#>"
+
 
 class RAGSystem:
     """基于LangChain的RAG系统"""
@@ -28,7 +31,8 @@ class RAGSystem:
     def __init__(self,
                  model_name: str = "qwen2.5:3b",
                  persist_dir: str = None,
-                 embedding_model: str = "nomic-embed-text"):
+                 embedding_model: str = "nomic-embed-text",
+                 distance_threshold: float = 1.0):
         """
         初始化RAG系统
 
@@ -36,10 +40,13 @@ class RAGSystem:
             model_name: Ollama模型名称
             persist_dir: 向量数据库持久化目录
             embedding_model: Ollama嵌入模型名称
+            distance_threshold: L2距离阈值，最佳检索结果的距离超过该值即视为知识库中无相关内容
+                （Chroma默认L2距离，范围约0~2，越小越相似；需根据日志中的实际距离调整）
         """
         self.model_name = model_name
         self.persist_dir = persist_dir or str(project_root / "data" / "chroma_db")
         self.embedding_model = embedding_model
+        self.distance_threshold = distance_threshold
 
         # 初始化LLM（嵌入与生成均走Ollama，Python侧不加载本地模型，节省内存）
         # trust_env=False：绕开系统代理，否则httpx会把localhost请求发给代理导致连接被拒
@@ -135,6 +142,31 @@ class RAGSystem:
         logger.info(f"✅ 向量数据库加载成功")
         return self.vectorstore
 
+    def collection_size(self) -> int:
+        """当前集合中的切片数量；集合为空或读取失败返回0（视为需要重建）"""
+        try:
+            return self.vectorstore._collection.count()
+        except Exception:
+            return 0
+
+    def retrieve(self, question: str, k: int = 3):
+        """按L2距离阈值检索相关文档，返回(是否命中知识库, 文档列表)
+
+        Chroma的similarity_search_with_score返回(embedding距离, 文档)，
+        距离越小越相似；最佳结果的距离仍超过阈值时视为知识库中无相关内容。
+        """
+        results = self.vectorstore.similarity_search_with_score(question, k=k)
+
+        if results:
+            best_distance = results[0][1]
+            logger.info(f"📏 最佳检索距离: {best_distance:.4f}（阈值: {self.distance_threshold}）")
+
+        docs = [
+            doc for doc, distance in results
+            if distance <= self.distance_threshold
+        ]
+        return (len(docs) > 0), docs
+
     def setup_qa_chain(self, k: int = 3):
         """设置问答链"""
         if not self.vectorstore:
@@ -143,8 +175,10 @@ class RAGSystem:
         logger.info(f"🔧 设置问答链，检索top-{k}个相关文档")
 
         # 自定义提示模板
-        template = """你是一个专业的问答助手。基于以下上下文信息回答问题。
-        如果上下文中没有相关信息，请诚实地说"我不知道"，不要编造答案。
+        template = """你是一个专业的问答助手。请回答用户的问题。
+
+        如果下面的上下文信息中有相关内容，请基于上下文回答。
+        如果上下文中没有相关信息，请用你自己的知识正常回答，不要说"我不知道"。
 
         上下文信息：
         {context}
@@ -180,10 +214,18 @@ class RAGSystem:
         if not self.qa_chain:
             raise ValueError("请先设置问答链")
 
-        result = self.qa_chain.invoke({"query": question})
+        # 先按阈值检索，判断知识库中是否有相关内容
+        found, docs = self.retrieve(question, k=3)
 
-        answer = result['result']
-        sources = result.get('source_documents', [])
+        if found:
+            # 命中知识库：走RAG问答链，答案基于检索到的上下文
+            result = self.qa_chain.invoke({"query": question})
+            answer = result['result']
+            sources = result.get('source_documents', [])
+        else:
+            # 未命中知识库：模型直接回答，并在前面加标注
+            answer = NOT_FOUND_TAG + self.llm.invoke(question)
+            sources = []
 
         return {
             "question": question,
@@ -252,11 +294,32 @@ def demo():
             "请手动创建该文件，或取消 demo() 中注释的自动生成代码后重新运行"
         )
 
-    # 4. 加载文档
-    documents = rag.load_documents(str(sample_data_path))
+    # 4/5. 已有向量库直接加载（秒开）；仅首次或 sample.txt 更新后才重建
+    #      重建需逐块调用Ollama嵌入接口，是之前启动慢的主因
+    import hashlib
 
-    # 5. 创建向量数据库
-    rag.create_vectorstore(documents)
+    sample_data_path = str(sample_data_path)
+    rebuild = True
+    try:
+        rag.load_vectorstore()
+        with open(sample_data_path, 'rb') as f:
+            file_hash = hashlib.md5(f.read()).hexdigest()
+
+        # metadata中记录来源文件哈希，一致则跳过重建
+        meta = rag.vectorstore._collection.metadata or {}
+        if meta.get("source_md5") == file_hash and rag.collection_size() > 0:
+            rebuild = False
+            print(f"⚡ 向量库已是最新，跳过重建（{rag.collection_size()} 个切片）")
+    except Exception as e:
+        logger.info(f"首次运行或向量库不可用，将重建: {e}")
+
+    if rebuild:
+        documents = rag.load_documents(sample_data_path)
+        rag.create_vectorstore(documents)
+        # 记录来源文件哈希，供下次启动比对
+        with open(sample_data_path, 'rb') as f:
+            file_hash = hashlib.md5(f.read()).hexdigest()
+        rag.vectorstore._collection.modify(metadata={"source_md5": file_hash})
 
     # 6. 设置问答链
     rag.setup_qa_chain(k=3)
