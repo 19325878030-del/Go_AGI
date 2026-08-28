@@ -7,6 +7,8 @@
           <value>
             <TabSessionState>
               <option name="provider" value="claude" />
+              <option name="sessionId" value="7fd0a25f-3f1a-4c65-9166-6c209263a60c" />
+              <option name="cwd" value="D:\Go_AGI" />
               <option name="model" value="claude-sonnet-5[1m]" />
               <option name="permissionMode" value="default" />
             </TabSessionState>

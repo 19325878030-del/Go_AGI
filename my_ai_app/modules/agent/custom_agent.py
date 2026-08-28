@@ -17,8 +17,13 @@ from my_ai_app.modules.agent.tools import (
     get_weather_forecast,
     calculator,
     convert_units,
-    web_search
+    web_search,
+    has_real_results
 )
+
+# 模型无法回答/无法操作时输出的标记文本，
+# chat()检测到它就会自动转入"搜索网络信息"兜底流程
+CANNOT_ANSWER_MARKER = "<#我无法操作,你可以->#>"
 
 
 class FunctionCallAgent:
@@ -122,7 +127,7 @@ class FunctionCallAgent:
             },
             "web_search": {
                 "function": web_search,
-                "description": "搜索网络信息",
+                "description": "搜索网络信息（返回网页摘要和Google/百度搜索链接）",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -150,12 +155,13 @@ class FunctionCallAgent:
             for name, info in tools.items()
         }
 
-    def _call_ollama(self, messages: List[Dict]) -> Dict:
+    def _call_ollama(self, messages: List[Dict], system_prompt: str = None) -> Dict:
         """调用Ollama API"""
         url = f"{self.ollama_url}/api/chat"
 
-        # 构建系统提示，告知模型可以使用工具
-        system_prompt = self._build_system_prompt()
+        # 构建系统提示，告知模型可以使用工具（可传入覆盖，用于禁用工具直接回答）
+        if system_prompt is None:
+            system_prompt = self._build_system_prompt()
 
         payload = {
             "model": self.model_name,
@@ -193,8 +199,51 @@ class FunctionCallAgent:
 1. 输出工具调用JSON后立即停止，不要输出任何其他内容
 2. 绝对不要自己编造工具的返回结果，结果由系统执行工具后提供
 3. 如果不需要工具，直接用自然语言回答，不要输出JSON
+4. 当你无法回答用户的问题，或者无法执行用户要求的操作时，不要编造答案，
+   先输出标记 <#我无法操作,你可以->#>，然后调用 web_search 工具
+   去Google或百度上搜索解决方法
+5. 先用你已有的知识回答问题，只有知识确实不够时才调用工具；
+   不要只回复搜索链接而不给出实质内容
 
 如果需要多个工具，可以分步调用。"""
+
+    def _fallback_reply(self, user_input: str, result: Any) -> str:
+        """
+        组装兜底回复：AI回答在前，搜索链接在后。
+
+        搜索没有真实命中时，模型下一轮只会复述兜底链接、给不出实质内容，
+        所以这里不再把结果喂回模型，而是确定性地拼出最终回复。
+        """
+        ai_answer = self._answer_without_tools(user_input)
+
+        links = []
+        if isinstance(result, list):
+            for item in result:
+                if isinstance(item, dict) and item.get('link'):
+                    links.append(f"- {item.get('title', '链接')}: {item['link']}")
+
+        return (
+            f"{ai_answer}\n\n"
+            f"{CANNOT_ANSWER_MARKER}\n"
+            f"你可以参考以下链接寻找解决方法:\n"
+            + "\n".join(links)
+        )
+
+    def _answer_without_tools(self, user_input: str) -> str:
+        """
+        绕过工具直接让AI回答。
+
+        兜底场景使用：模型已声明无法操作，此时不再引导它调工具
+        （它自己说了答不了），而是换一个不带工具说明的系统提示，
+        让它凭已有知识先给出一个尽力而为的答案。
+        """
+        messages = [{"role": "user", "content": user_input}]
+        response = self._call_ollama(
+            messages,
+            system_prompt="你是一个智能助手。请根据你已有的知识，尽最大努力回答用户的问题或给出解决思路。不要输出任何JSON或工具调用。"
+        )
+        answer = response.get("message", {}).get("content", "").strip()
+        return answer if answer else "抱歉，我暂时无法回答这个问题。"
 
     def _parse_tool_call(self, response: str) -> Dict:
         """
@@ -276,6 +325,14 @@ class FunctionCallAgent:
                         "result": result
                     })
 
+                # 搜索没有真实命中（只剩Google/百度兜底链接或失败提示）时，
+                # 不把结果喂回模型——小模型面对空结果只会复述链接，
+                # 改为确定性地输出：AI回答在前 + 链接在后
+                if tool_name == "web_search" and not has_real_results(result):
+                    final_reply = self._fallback_reply(user_input, result)
+                    print(f"🤖 Agent: {final_reply}")
+                    return final_reply
+
                 # 将工具结果添加到对话历史
                 # 注意：存入的是解析出的干净JSON指令，而不是模型原文——
                 # 小模型原文里常夹带它自己编造的"工具结果"，混入历史会误导后续轮次
@@ -287,6 +344,26 @@ class FunctionCallAgent:
 
                 iteration += 1
                 continue
+
+            # 没有工具调用，但模型声明了无法回答/无法操作——
+            # 兜底流程：先让AI凭已有知识回答，再附上Google/百度搜索链接
+            if CANNOT_ANSWER_MARKER in content:
+                print("🤔 Agent表示无法操作，先用AI直接回答，再附上搜索链接")
+
+                search_query = user_input  # 用原始问题作为搜索词最贴近用户意图
+                result = self._execute_tool("web_search", {"query": search_query})
+                print(f"📊 搜索结果: {json.dumps(result, ensure_ascii=False)[:200]}...")
+
+                if trace is not None:
+                    trace.append({
+                        "tool": "web_search",
+                        "parameters": {"query": search_query},
+                        "result": result
+                    })
+
+                final_reply = self._fallback_reply(user_input, result)
+                print(f"🤖 Agent: {final_reply}")
+                return final_reply
 
             # 没有工具调用，直接回答
             print(f"🤖 Agent: {content}")

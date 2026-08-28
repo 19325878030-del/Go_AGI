@@ -2,6 +2,7 @@
 import requests
 from typing import List, Dict, Optional
 import json
+from urllib.parse import quote_plus
 
 
 class WebSearchTool:
@@ -52,10 +53,39 @@ class WebSearchTool:
                         'link': topic.get('FirstURL', '')
                     })
 
+            # 无论DuckDuckGo是否返回内容，都附上Google/百度搜索链接，
+            # 供用户在无法直接回答时自行查阅解决方法
+            encoded_q = quote_plus(query)
+            results.append({
+                'title': 'Google搜索',
+                'snippet': f'在Google上搜索"{query}"的解决方法',
+                'link': f'https://www.google.com/search?q={encoded_q}'
+            })
+            results.append({
+                'title': '百度搜索',
+                'snippet': f'在百度上搜索"{query}"的解决方法',
+                'link': f'https://www.baidu.com/s?wd={encoded_q}'
+            })
+
             return results
 
         except Exception as e:
             return [{'title': '搜索失败', 'snippet': f'错误: {str(e)}', 'link': ''}]
+
+
+# 固定追加的兜底链接标题，用于识别"搜索没有命中真实结果"的情况
+FALLBACK_LINK_TITLES = {'Google搜索', '百度搜索'}
+
+
+def has_real_results(results) -> bool:
+    """判断搜索结果里是否有真实命中（排除兜底链接和失败提示）"""
+    if not isinstance(results, list):
+        return False
+    for item in results:
+        if isinstance(item, dict) and item.get('title') not in FALLBACK_LINK_TITLES \
+                and item.get('title') != '搜索失败':
+            return True
+    return False
 
 
 # 创建全局实例
