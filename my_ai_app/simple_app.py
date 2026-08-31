@@ -16,7 +16,12 @@ app = Flask(__name__)
 
 # 配置
 OLLAMA_URL = "http://localhost:11434/api/generate"
+OLLAMA_BASE="http://localhost:11434"  #ollama服务根地址，用于查询模型列表
 MODEL_NAME = "llama3.2:1b"  # 内存紧张时的小模型（约1GB）；内存充足可换回 "qwen2.5:3b"
+
+#当前使用的模型，运行时由/api/chat按前端选择更新
+_current_model =MODEL_NAME
+
 
 
 @app.route('/')
@@ -107,6 +112,13 @@ def index():
                 outline: none;
                 border-color: #667eea;
             }
+            select{
+                padding: 6px 10px;
+                border:1px solid #ddd;
+                border-radius:8px;
+                font-size:14px;
+                max-width:220px;
+                }
             button {
                 padding: 12px 30px;
                 background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
@@ -198,6 +210,9 @@ def index():
             </div>
             <div class="controls">
                 <label>
+                    模型：<select id="modelSelect"><option value="">加载中。。。</option></select>
+                </label>    
+                <label>
                     温度: <input type="range" id="temperature" min="0" max="2" step="0.1" value="0.7" style="width:100px">
                     <span id="tempDisplay">0.7</span>
                 </label>
@@ -221,6 +236,30 @@ def index():
             const temperature = document.getElementById('temperature');
             const tempDisplay = document.getElementById('tempDisplay');
             const status = document.getElementById('status');
+            const modelSelect = document.getElementById('modelSelect'); 
+            //页面加载时获取ollama已安装的模型列表
+            async function loadModels(){
+                try{
+                    const response = await fetch('/api/models');
+                    const data = await response.json();
+                    modelSelect.innerHTML = '';
+                    (data.models || []).forEach(name =>{
+                        const option =document.createElement('option');
+                        option.value =name;
+                        option.textContent = name;
+                        modelSelect.appendChild(option);
+                    });
+                    if(data.current &&data.models.includes(data.current)){
+                    modelSelect.value = data.current;
+                    }
+                    status.textContent = data.models.length > 0
+                        ? '✅ 服务运行中，已加载 ' + data.models.length + ' 个模型'
+                        : '⚠️ 未获取到模型，请确认Ollama已启动';
+                } catch (e) {
+                    status.textContent = '⚠️ 获取模型列表失败: ' + e.message;
+                }
+            }
+            loadModels();
 
             function getMode() {
                 const checked = document.querySelector('input[name="mode"]:checked');
@@ -265,7 +304,8 @@ def index():
                         body: JSON.stringify({
                             message: message,
                             mode: getMode(),
-                            temperature: parseFloat(temperature.value)
+                            temperature: parseFloat(temperature.value),
+                            model:modelSelect.value
                         })
                     });
 
@@ -325,14 +365,46 @@ def index():
     '''
 
 
+#插入新路由,新增 /api/models 接口
+@app.route('/api/models',methods=['GET'])
+def list_models():
+    """返回ollama已安装的模型列表"""
+    try:
+        response=requests.get(f"{OLLAMA_BASE}/api/tags",timeout=5)
+        response.raise_for_status()
+        data=response.json()
+        # 过滤嵌入模型（如nomic-embed-text）：family是bert类或名字带embed的
+        # 只能算向量不能对话，选它调generate会被Ollama拒绝(400)
+        models = [
+            m['name'] for m in data.get('models', [])
+            if 'embed' not in m['name'] and 'bert' not in m.get('details', {}).get('family', '')
+        ]
+
+        return jsonify({'models':models,'current':_current_model})
+    except Exception as e:
+        return jsonify({'models':[],'current':_current_model,'error':str(e)})
+
+
+
+
 @app.route('/api/chat', methods=['POST'])
 def chat():
     """聊天API"""
+    global _rag_system, _agent_instance, _current_model
     try:
         data = request.json
         message = data.get('message', '')
         mode = data.get('mode', 'agent')  # agent / rag / llm
         temperature = data.get('temperature', 0.7)
+        model=data.get('model') or MODEL_NAME
+
+        #模型变化时丢弃旧例，rag和agent下次调用会用新模型重建
+        if model != _current_model:
+            _rag_system=None
+            _agent_instance=None
+            _current_model =model
+            print(f"🔄 切换模型:{model}")
+
 
         if not message:
             return jsonify({'error': '请输入问题'})
@@ -354,10 +426,11 @@ def chat():
         return jsonify({'error': str(e)})
 
 
-def chat_with_llm(message, temperature):
+def chat_with_llm(message, temperature,model=None):
     """直接调用LLM"""
+    model = model or _current_model # 未显式传入时用当前选中模型
     payload = {
-        "model": MODEL_NAME,
+        "model": model,
         "prompt": message,
         "stream": False,
         "options": {
@@ -386,7 +459,7 @@ def get_rag_system():
     if _rag_system is None:
         from modules.rag.rag_demo import RAGSystem
 
-        rag = RAGSystem(model_name=MODEL_NAME)
+        rag = RAGSystem(model_name=_current_model)
         sample_path = project_root / "data" / "sample.txt"
 
         if not sample_path.exists():
@@ -430,8 +503,8 @@ def get_agent():
         from modules.agent.custom_agent import FunctionCallAgent
 
         _agent_instance = FunctionCallAgent(
-            model_name=MODEL_NAME,
-            ollama_url="http://localhost:11434"
+            model_name=_current_model,
+            ollama_url=OLLAMA_BASE
         )
     return _agent_instance
 
