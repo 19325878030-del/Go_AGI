@@ -7,12 +7,16 @@ import json
 from pathlib import Path
 from flask import Flask, render_template, request, jsonify
 import requests
+import os
+
 
 # 添加项目路径
 project_root = Path(__file__).parent
 sys.path.append(str(project_root))
 
 app = Flask(__name__)
+# 登录session签名密钥（配合 controllers/ 登录注册功能，部署前请换成随机字符串）
+app.secret_key = 'dev-secret-key-change-me'
 
 # 配置
 OLLAMA_URL = "http://localhost:11434/api/generate"
@@ -188,11 +192,94 @@ def index():
                 0% { transform: rotate(0deg); }
                 100% { transform: rotate(360deg); }
             }
+
+            /* ==================== 登录注册 ==================== */
+            .auth-bar {
+                display: flex;
+                justify-content: flex-end;
+                align-items: center;
+                gap: 10px;
+                margin-bottom: 15px;
+                font-size: 14px;
+                color: #666;
+            }
+            .auth-bar button {
+                padding: 6px 14px;
+                font-size: 13px;
+                border-radius: 8px;
+            }
+            .modal-mask {
+                display: none;
+                position: fixed;
+                inset: 0;
+                background: rgba(0, 0, 0, 0.45);
+                justify-content: center;
+                align-items: center;
+                z-index: 100;
+            }
+            .modal-mask.show {
+                display: flex;
+            }
+            .modal {
+                background: white;
+                border-radius: 16px;
+                padding: 30px;
+                width: 340px;
+                max-width: 90vw;
+                box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            }
+            .modal h2 {
+                text-align: center;
+                color: #333;
+                font-size: 22px;
+                margin-bottom: 20px;
+            }
+            .modal input {
+                width: 100%;
+                padding: 10px 12px;
+                border: 1px solid #ddd;
+                border-radius: 8px;
+                font-size: 14px;
+                margin-bottom: 12px;
+                box-sizing: border-box;
+            }
+            .modal input:focus {
+                outline: none;
+                border-color: #667eea;
+            }
+            .modal .error {
+                color: #e74c3c;
+                font-size: 13px;
+                min-height: 18px;
+                margin-bottom: 8px;
+                text-align: center;
+            }
+            .modal .btn-row {
+                display: flex;
+                gap: 10px;
+            }
+            .modal .btn-row button {
+                flex: 1;
+                padding: 10px;
+                font-size: 14px;
+            }
+            .modal .btn-row .btn-secondary {
+                background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+            }
+            .modal .btn-row .btn-cancel {
+                background: #9aa0a6;
+            }
         </style>
     </head>
     <body>
         <div class="container">
             <h1>🤖 AI 助手</h1>
+
+            <!-- 登录注册：状态栏，登录后显示用户名 -->
+            <div class="auth-bar">
+                <span id="authStatus">👤 未登录</span>
+                <button id="authToggleBtn" onclick="showAuthModal()">登录 / 注册</button>
+            </div>
 
             <div class="controls">
                 <label>
@@ -227,6 +314,21 @@ def index():
                 <button id="sendBtn" onclick="sendMessage()">发送</button>
             </div>
             <div class="status" id="status">✅ 服务运行中</div>
+        </div>
+
+        <!-- 登录/注册弹窗（放在script之前，保证脚本执行时能取到DOM） -->
+        <div class="modal-mask" id="authModal">
+            <div class="modal">
+                <h2>账号登录 / 注册</h2>
+                <input type="text" id="authUsername" placeholder="用户名（至少2个字符）" autocomplete="username">
+                <input type="password" id="authPassword" placeholder="密码（至少6位）" autocomplete="current-password">
+                <div class="error" id="authError"></div>
+                <div class="btn-row">
+                    <button onclick="doLogin()">登录</button>
+                    <button class="btn-secondary" onclick="doRegister()">注册</button>
+                    <button class="btn-cancel" onclick="hideAuthModal()">取消</button>
+                </div>
+            </div>
         </div>
 
         <script>
@@ -309,6 +411,13 @@ def index():
                         })
                     });
 
+                    // 后端启用登录保护后，未登录会返回401
+                    if (response.status === 401) {
+                        addMessage('assistant', '🔒 请先登录后再对话');
+                        showAuthModal();
+                        return;
+                    }
+
                     const data = await response.json();
 
                     if (data.error) {
@@ -359,6 +468,109 @@ def index():
                 chatBox.appendChild(div);
                 chatBox.scrollTop = chatBox.scrollHeight;
             }
+
+            // ==================== 登录注册 ====================
+            // 依赖后端 controllers/auth_controller.py 的四个接口：
+            //   POST /api/auth/register  {username, password}
+            //   POST /api/auth/login     {username, password}
+            //   POST /api/auth/logout
+            //   GET  /api/auth/me        → {"user": {"id","username"} | null}
+            // 后端未实现时这里会静默降级为"未登录"，不影响聊天功能
+            const authModal = document.getElementById('authModal');
+            const authUsername = document.getElementById('authUsername');
+            const authPassword = document.getElementById('authPassword');
+            const authError = document.getElementById('authError');
+            const authStatusEl = document.getElementById('authStatus');
+            const authToggleBtn = document.getElementById('authToggleBtn');
+
+            function showAuthModal() {
+                authError.textContent = '';
+                authModal.classList.add('show');
+                authUsername.focus();
+            }
+
+            function hideAuthModal() {
+                authModal.classList.remove('show');
+            }
+
+            // 点击遮罩空白处关闭弹窗
+            authModal.addEventListener('click', function (e) {
+                if (e.target === authModal) hideAuthModal();
+            });
+
+            // 密码框内按回车 = 登录
+            authPassword.addEventListener('keydown', function (e) {
+                if (e.key === 'Enter') doLogin();
+            });
+
+            async function doLogin() {
+                await submitAuth('/api/auth/login', '登录');
+            }
+
+            async function doRegister() {
+                await submitAuth('/api/auth/register', '注册');
+            }
+
+            async function submitAuth(url, actionName) {
+                const username = authUsername.value.trim();
+                const password = authPassword.value;
+                if (!username || !password) {
+                    authError.textContent = '请输入用户名和密码';
+                    return;
+                }
+                try {
+                    authError.textContent = '';
+                    const response = await fetch(url, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ username: username, password: password })
+                    });
+                    const data = await response.json();
+                    if (!response.ok) {
+                        authError.textContent = data.error || (actionName + '失败');
+                        return;
+                    }
+                    authPassword.value = '';
+                    hideAuthModal();
+                    refreshAuthStatus();
+                } catch (e) {
+                    // 接口返回非JSON（如404页面）会走到这里，多半是后端还没实现
+                    authError.textContent = '请求失败（后端接口未实现?）: ' + e.message;
+                }
+            }
+
+            async function doLogout() {
+                try {
+                    await fetch('/api/auth/logout', { method: 'POST' });
+                } catch (e) { /* 忽略网络错误 */ }
+                refreshAuthStatus();
+            }
+
+            async function refreshAuthStatus() {
+                // 查询当前登录用户并刷新状态栏；接口不存在/未实现时按未登录处理
+                try {
+                    const response = await fetch('/api/auth/me');
+                    const data = await response.json();
+                    updateAuthUI(data.user);
+                } catch (e) {
+                    updateAuthUI(null);
+                }
+            }
+
+            function updateAuthUI(user) {
+                if (user) {
+                    authStatusEl.textContent = '👤 ' + user.username;
+                    authToggleBtn.textContent = '退出登录';
+                    authToggleBtn.onclick = doLogout;
+                } else {
+                    authStatusEl.textContent = '👤 未登录';
+                    authToggleBtn.textContent = '登录 / 注册';
+                    authToggleBtn.onclick = showAuthModal;
+                }
+            }
+
+            // 页面加载完成后恢复登录状态（放在末尾，确保上面的DOM引用已初始化）
+            refreshAuthStatus();
         </script>
     </body>
     </html>
@@ -529,8 +741,9 @@ def chat_with_agent(message):
 
 
 if __name__ == '__main__':
+    PORT = 5001  # 5000常被残留的旧进程占用，换用5001
     print("=" * 50)
     print("🚀 启动AI助手 (极简版)")
-    print("📍 http://localhost:5000")
+    print(f"📍 http://localhost:{PORT}")
     print("=" * 50)
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    app.run(debug=True, host='0.0.0.0', port=PORT)

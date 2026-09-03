@@ -7,7 +7,7 @@
           <value>
             <TabSessionState>
               <option name="provider" value="claude" />
-              <option name="sessionId" value="489687bf-0f50-432d-bee6-5cd96a2ba290" />
+              <option name="sessionId" value="64e7cbbd-365c-445b-a182-8c82dcc6ba52" />
               <option name="cwd" value="D:\Go_AGI" />
               <option name="model" value="claude-fable-5[1m]" />
               <option name="permissionMode" value="bypassPermissions" />
