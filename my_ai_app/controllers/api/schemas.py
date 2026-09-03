@@ -1,9 +1,9 @@
-# my_ai_app/modules/auth/api/schemas.py
+# my_ai_app/controllers/api/schemas.py
 """
 接口层 —— 前端收集的参数模型（入参）。
 
 这里只描述「前端会传哪些参数」，不做业务校验；
-业务校验逻辑（用户名/密码检测）统一放在 service/auth_service.py。
+业务校验逻辑（用户名/密码检测）统一放在 services/user_service.py。
 
 前后端约定（以 simple_app.py 前端为准）：
     注册 / 登录 前端都只提交两个字段：

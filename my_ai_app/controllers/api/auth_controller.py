@@ -1,10 +1,10 @@
-# my_ai_app/modules/auth/api/auth_api.py
+# my_ai_app/controllers/api/auth_controller.py
 """
 接口层 —— 登录注册接口入口（Flask Blueprint）。
 
 只做三件事：
     1. 接收前端收集的参数（schemas.py）
-    2. 调用 service 层的检测/校验逻辑（auth_service.py）
+    2. 调用 services 层的检测/校验逻辑（user_service.py）
     3. 返回 JSON；并自动记录每个接口的 入参/出参（log_service.py）
 
 接口清单（与 simple_app.py 前端约定一致）：
@@ -19,8 +19,8 @@ from functools import wraps
 from flask import Blueprint, request, jsonify, session
 
 from .schemas import RegisterParams, LoginParams
-from ..service import auth_service
-from ..service import log_service
+from services import user_service
+from services import log_service
 
 auth_bp = Blueprint('auth', __name__, url_prefix='/api/auth')
 
@@ -97,10 +97,12 @@ def register():
     data = request.get_json(silent=True) or {}
     params = RegisterParams.from_dict(data)
 
-    ok, msg, user = auth_service.create_user(params.username, params.password)
+    ok, msg = user_service.create_user(params.username, params.password)
     if not ok:
         return jsonify({'error': msg}), 400
 
+    # 注册成功直接登录
+    user = user_service.verify_user(params.username, params.password)
     session['user_id'] = user['id']
     session['username'] = user['username']
     return jsonify({'message': '注册成功', 'username': user['username']})
@@ -113,9 +115,9 @@ def login():
     data = request.get_json(silent=True) or {}
     params = LoginParams.from_dict(data)
 
-    ok, msg, user = auth_service.login(params.username, params.password)
-    if not ok:
-        return jsonify({'error': msg}), 401
+    user = user_service.verify_user(params.username, params.password)
+    if user is None:
+        return jsonify({'error': '用户名或密码错误'}), 401
 
     session['user_id'] = user['id']
     session['username'] = user['username']
@@ -135,7 +137,7 @@ def logout():
 def me():
     """前端页面刷新后恢复登录状态：返回当前用户或 null。"""
     uid = session.get('user_id')
-    user = auth_service.get_user_by_id(uid) if uid else None
+    user = user_service.get_user_by_id(uid) if uid else None
     if uid and user is None:
         session.clear()
     return jsonify({'user': user})

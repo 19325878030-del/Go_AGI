@@ -1,29 +1,13 @@
-# my_ai_app/modules/auth/service/auth_service.py
-"""
-服务层 —— 登录注册的「检测/校验逻辑」+ 数据库读写。
-
-职责：
-    * 检测入参（用户名/密码格式）            validate_params()
-    * 注册：检测通过后哈希密码入库（保存数据库）create_user()
-    * 登录：校验用户名密码（登录逻辑）        verify_user() / login()
-    * 查询：按 id 查用户（登录态恢复用）      get_user_by_id()
-
-说明：本层不依赖 flask（不 import request/session），保证可复用、可单独测试。
-"""
+# my_ai_app/services/user_service.py
+"""用户服务：注册/登录校验的业务逻辑，不依赖flask"""
 import sqlite3
 import threading
 from pathlib import Path
-
 from werkzeug.security import generate_password_hash, check_password_hash
 
-# my_ai_app/ 目录（本文件位于 my_ai_app/modules/auth/service/）
-BASE_DIR = Path(__file__).resolve().parents[3]
-DB_PATH = BASE_DIR / "data" / "users.db"
-
-USERNAME_MIN = 2   # 与前端约定：用户名至少 2 个字符
-PASSWORD_MIN = 6   # 与前端约定：密码至少 6 位
-
-_lock = threading.Lock()  # Flask debug 多线程并发写保护
+DB_PATH = Path(__file__).resolve().parent.parent / "data" / "users.db"
+USERNAME_MIN, PASSWORD_MIN = 2, 6
+_lock = threading.Lock()  # 保证并发写安全
 
 
 def _conn() -> sqlite3.Connection:
@@ -33,7 +17,7 @@ def _conn() -> sqlite3.Connection:
 
 
 def init_db():
-    """建 users 表（存在则跳过），应用启动时调用一次。"""
+    """建表（存在则跳过），应用启动时调用一次"""
     with _lock:
         conn = _conn()
         try:
@@ -62,31 +46,30 @@ def validate_params(username: str, password: str):
 
 
 def create_user(username: str, password: str):
-    """注册：检测入参 -> 哈希密码 -> 保存数据库。返回 (成功?, 错误信息, 用户dict)。"""
+    """注册：检测入参 -> 哈希密码 -> 保存数据库。返回 (成功?, 错误信息)"""
     ok, msg = validate_params(username, password)
     if not ok:
-        return False, msg, None
+        return False, msg
 
     try:
         with _lock:
             conn = _conn()
             try:
-                cur = conn.execute(
+                conn.execute(
                     "INSERT INTO users (username, password_hash) VALUES (?, ?)",
                     (username, generate_password_hash(password)),
                 )
                 conn.commit()
-                uid = cur.lastrowid
             finally:
                 conn.close()
-        return True, None, {"id": uid, "username": username}
+        return True, None
     except sqlite3.IntegrityError:
-        return False, "用户名已被注册", None
+        return False, "用户名已被注册"
 
 
 def verify_user(username: str, password: str):
-    """登录检测：校验用户名密码。成功返回 {'id','username'}，失败返回 None。
-    （用户不存在与密码错误统一返回 None，避免泄露用户是否注册过）"""
+    """校验用户名密码：成功返回 {'id','username'}，失败返回 None
+    （用户不存在与密码错误返回一样，避免泄露用户是否注册过）"""
     conn = _conn()
     try:
         row = conn.execute(
@@ -98,17 +81,6 @@ def verify_user(username: str, password: str):
     if row is None or not check_password_hash(row["password_hash"], password):
         return None
     return {"id": row["id"], "username": row["username"]}
-
-
-def login(username: str, password: str):
-    """登录逻辑：先检测入参，再校验用户名密码。返回 (成功?, 错误信息, 用户dict)。"""
-    ok, msg = validate_params(username, password)
-    if not ok:
-        return False, msg, None
-    user = verify_user(username, password)
-    if user is None:
-        return False, "用户名或密码错误", None
-    return True, None, user
 
 
 def get_user_by_id(uid: int):

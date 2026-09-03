@@ -18,14 +18,15 @@ app = Flask(__name__)
 # 登录session签名密钥（配合 controllers/ 登录注册功能，部署前请换成随机字符串）
 app.secret_key = 'dev-secret-key-change-me'
 
-# ==================== 登录注册模块（后端，modules/auth） ====================
+# ==================== 登录注册（controllers 接口层 + services 业务层） ====================
 # 接口：POST /api/auth/register、POST /api/auth/login、
 #       POST /api/auth/logout、GET  /api/auth/me
 # 每个接口都会自动记录「接口 + 入参 + 出参」到：
 #   data/logs/api_requests.jsonl（联调时 tail 直接看）
 #   data/api_logs.db（结构化，方便 SQL 查询）
-from modules.auth import auth_bp
-from modules.auth.service import init_db, init_log_db
+from controllers import auth_bp
+from services.user_service import init_db
+from services.log_service import init_log_db
 
 app.register_blueprint(auth_bp)
 init_db()        # 建 users 表（注册数据保存到 data/users.db）
@@ -754,8 +755,9 @@ def chat_with_agent(message):
 
 
 if __name__ == '__main__':
+    PORT = 5001  # 5000被本机其他项目（Harness）占用，固定用5001
     print("=" * 50)
     print("🚀 启动AI助手 (极简版)")
-    print("📍 http://localhost:5000")
+    print(f"📍 http://localhost:{PORT}")
     print("=" * 50)
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    app.run(debug=True, host='0.0.0.0', port=PORT)

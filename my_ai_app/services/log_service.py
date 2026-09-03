@@ -1,4 +1,4 @@
-# my_ai_app/modules/auth/service/log_service.py
+# my_ai_app/services/log_service.py
 """
 服务层 —— 入参/出参记录（联调日志）。
 
@@ -18,7 +18,7 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
-BASE_DIR = Path(__file__).resolve().parents[3]   # my_ai_app/
+BASE_DIR = Path(__file__).resolve().parent.parent   # my_ai_app/
 DATA_DIR = BASE_DIR / "data"
 LOG_DIR = DATA_DIR / "logs"
 LOG_FILE = LOG_DIR / "api_requests.jsonl"
