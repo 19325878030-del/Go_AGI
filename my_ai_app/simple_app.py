@@ -9,6 +9,14 @@ from flask import Flask, render_template, request, jsonify
 import requests
 import os
 
+# Windows 控制台默认 GBK 编码，print emoji（🚀🔄等）会抛 UnicodeEncodeError 直接崩，
+# 这里强制标准输出为 UTF-8，保证任何终端/后台运行都安全
+try:
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+except Exception:
+    pass
+
 
 # 添加项目路径
 project_root = Path(__file__).parent
@@ -17,6 +25,14 @@ sys.path.append(str(project_root))
 app = Flask(__name__)
 # 登录session签名密钥（配合 controllers/ 登录注册功能，部署前请换成随机字符串）
 app.secret_key = 'dev-secret-key-change-me'
+
+# ==================== 跨域支持（前端联调用） ====================
+# 前端独立开发服务器（如 Vite 的 localhost:5173）调本服务时，浏览器会拦截跨源请求。
+# supports_credentials=True 允许跨源携带 Cookie —— 登录态靠 session，没这个登录接口调不通。
+# 注意：前端 fetch 必须写 credentials: 'include'，否则 Cookie 不会发过来。
+# 联调专用写法；上线前请改成明确白名单，如 CORS(app, origins=["http://localhost:5173"], supports_credentials=True)
+from flask_cors import CORS
+CORS(app, supports_credentials=True)
 
 # ==================== 登录注册（controllers 接口层 + services 业务层） ====================
 # 接口：POST /api/auth/register、POST /api/auth/login、
