@@ -754,9 +754,8 @@ def chat_with_agent(message):
 
 
 if __name__ == '__main__':
-    PORT = 5001  # 5000常被残留的旧进程占用，换用5001
     print("=" * 50)
     print("🚀 启动AI助手 (极简版)")
-    print(f"📍 http://localhost:{PORT}")
+    print("📍 http://localhost:5000")
     print("=" * 50)
-    app.run(debug=True, host='0.0.0.0', port=PORT)
+    app.run(debug=True, host='0.0.0.0', port=5000)
