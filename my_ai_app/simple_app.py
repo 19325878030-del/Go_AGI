@@ -18,6 +18,19 @@ app = Flask(__name__)
 # 登录session签名密钥（配合 controllers/ 登录注册功能，部署前请换成随机字符串）
 app.secret_key = 'dev-secret-key-change-me'
 
+# ==================== 登录注册模块（后端，modules/auth） ====================
+# 接口：POST /api/auth/register、POST /api/auth/login、
+#       POST /api/auth/logout、GET  /api/auth/me
+# 每个接口都会自动记录「接口 + 入参 + 出参」到：
+#   data/logs/api_requests.jsonl（联调时 tail 直接看）
+#   data/api_logs.db（结构化，方便 SQL 查询）
+from modules.auth import auth_bp
+from modules.auth.service import init_db, init_log_db
+
+app.register_blueprint(auth_bp)
+init_db()        # 建 users 表（注册数据保存到 data/users.db）
+init_log_db()    # 建 api_logs 表 + logs 目录（联调日志）
+
 # 配置
 OLLAMA_URL = "http://localhost:11434/api/generate"
 OLLAMA_BASE="http://localhost:11434"  #ollama服务根地址，用于查询模型列表
