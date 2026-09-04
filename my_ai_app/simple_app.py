@@ -39,13 +39,13 @@ CORS(app, supports_credentials=True)
 #       POST /api/auth/logout、GET  /api/auth/me
 # 每个接口都会自动记录「接口 + 入参 + 出参」到：
 #   data/logs/api_requests.jsonl（联调时 tail 直接看）
-#   data/api_logs.db（结构化，方便 SQL 查询）
+#   TiDB Cloud 的 api_logs 表（结构化，方便 SQL 查询）
 from controllers import auth_bp
 from services.user_service import init_db
 from services.log_service import init_log_db
 
 app.register_blueprint(auth_bp)
-init_db()        # 建 users 表（注册数据保存到 data/users.db）
+init_db()        # 建 users 表（注册数据保存到 TiDB Cloud）
 init_log_db()    # 建 api_logs 表 + logs 目录（联调日志）
 
 # 配置

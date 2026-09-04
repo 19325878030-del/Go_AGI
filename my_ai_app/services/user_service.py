@@ -1,37 +1,33 @@
 # my_ai_app/services/user_service.py
-"""用户服务：注册/登录校验的业务逻辑，不依赖flask"""
-import sqlite3
-import threading
-from pathlib import Path
+"""用户服务：注册/登录校验的业务逻辑，不依赖flask
+
+存储：TiDB Cloud（配置见 .env，连接见 services/db.py）。
+表结构由 init_db() / data/tidb/setup_tidb.py 创建（幂等）。
+"""
+import pymysql
 from werkzeug.security import generate_password_hash, check_password_hash
 
-DB_PATH = Path(__file__).resolve().parent.parent / "data" / "users.db"
+from services.db import get_conn
+
 USERNAME_MIN, PASSWORD_MIN = 2, 6
-_lock = threading.Lock()  # 保证并发写安全
-
-
-def _conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
 
 
 def init_db():
     """建表（存在则跳过），应用启动时调用一次"""
-    with _lock:
-        conn = _conn()
-        try:
-            conn.execute("""
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS users (
-                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                    username      TEXT UNIQUE NOT NULL,
-                    password_hash TEXT NOT NULL,          -- 只存哈希，绝不存明文
-                    created_at    TEXT DEFAULT (datetime('now','localtime'))
+                    id            INT AUTO_INCREMENT PRIMARY KEY,
+                    username      VARCHAR(50)  UNIQUE NOT NULL,
+                    password_hash VARCHAR(255) NOT NULL,   -- 只存哈希，绝不存明文
+                    created_at    DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
             """)
-            conn.commit()
-        finally:
-            conn.close()
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def validate_params(username: str, password: str):
@@ -51,31 +47,32 @@ def create_user(username: str, password: str):
     if not ok:
         return False, msg
 
+    conn = get_conn()
     try:
-        with _lock:
-            conn = _conn()
-            try:
-                conn.execute(
-                    "INSERT INTO users (username, password_hash) VALUES (?, ?)",
-                    (username, generate_password_hash(password)),
-                )
-                conn.commit()
-            finally:
-                conn.close()
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO users (username, password_hash) VALUES (%s, %s)",
+                (username, generate_password_hash(password)),
+            )
+        conn.commit()
         return True, None
-    except sqlite3.IntegrityError:
+    except pymysql.err.IntegrityError:
         return False, "用户名已被注册"
+    finally:
+        conn.close()
 
 
 def verify_user(username: str, password: str):
     """校验用户名密码：成功返回 {'id','username'}，失败返回 None
     （用户不存在与密码错误返回一样，避免泄露用户是否注册过）"""
-    conn = _conn()
+    conn = get_conn()
     try:
-        row = conn.execute(
-            "SELECT id, username, password_hash FROM users WHERE username = ?",
-            (username,),
-        ).fetchone()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, username, password_hash FROM users WHERE username = %s",
+                (username,),
+            )
+            row = cur.fetchone()
     finally:
         conn.close()
     if row is None or not check_password_hash(row["password_hash"], password):
@@ -87,11 +84,11 @@ def get_user_by_id(uid: int):
     """按 id 查用户，供登录态校验/恢复。"""
     if uid is None:
         return None
-    conn = _conn()
+    conn = get_conn()
     try:
-        row = conn.execute(
-            "SELECT id, username FROM users WHERE id = ?", (uid,)
-        ).fetchone()
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, username FROM users WHERE id = %s", (uid,))
+            row = cur.fetchone()
     finally:
         conn.close()
     return {"id": row["id"], "username": row["username"]} if row else None

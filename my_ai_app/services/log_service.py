@@ -10,51 +10,55 @@
 
 同时写两处：
     1. data/logs/api_requests.jsonl —— 追加式 JSON 行，联调时 tail 直接看
-    2. data/api_logs.db 的 api_logs 表 —— 结构化保存，方便 SQL 查询
+    2. TiDB Cloud 的 api_logs 表 —— 结构化保存，方便 SQL 查询
 """
 import json
-import sqlite3
 import threading
 from datetime import datetime
 from pathlib import Path
+
+from services.db import get_conn
 
 BASE_DIR = Path(__file__).resolve().parent.parent   # my_ai_app/
 DATA_DIR = BASE_DIR / "data"
 LOG_DIR = DATA_DIR / "logs"
 LOG_FILE = LOG_DIR / "api_requests.jsonl"
-LOG_DB_PATH = DATA_DIR / "api_logs.db"
 
-_lock = threading.Lock()
+_lock = threading.Lock()  # 保护文件日志的并发追加
 
 
 def init_log_db():
     """建 api_logs 表 + logs 目录，应用启动时调用一次。"""
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    with _lock:
-        conn = sqlite3.connect(LOG_DB_PATH)
-        try:
-            conn.execute("""
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS api_logs (
-                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                    interface       TEXT NOT NULL,   -- 接口路径，如 /api/auth/login
-                    method          TEXT NOT NULL,   -- HTTP 方法
-                    request_params  TEXT NOT NULL,   -- 入参(JSON)
-                    response_params TEXT NOT NULL,   -- 出参(JSON)
-                    status_code     INTEGER,
-                    user_id         INTEGER,
-                    username        TEXT,
-                    duration_ms     INTEGER,
-                    created_at      TEXT DEFAULT (datetime('now','localtime'))
+                    id              INT AUTO_INCREMENT PRIMARY KEY,
+                    interface       VARCHAR(200) NOT NULL,  -- 接口路径，如 /api/auth/login
+                    method          VARCHAR(10)  NOT NULL,  -- HTTP 方法
+                    request_params  TEXT NOT NULL,          -- 入参(JSON)
+                    response_params TEXT NOT NULL,          -- 出参(JSON)
+                    status_code     INT,
+                    user_id         INT,
+                    username        VARCHAR(50),
+                    duration_ms     INT,
+                    created_at      DATETIME
                 )
             """)
-            conn.commit()
-        finally:
-            conn.close()
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def log_request(interface, method, request_params, response_params,
                 status_code=200, user_id=None, username=None, duration_ms=0):
-    """记录一次接口调用的入参/出参。request/response 会做 JSON 序列化。"""
+    """记录一次接口调用的入参/出参。request/response 会做 JSON 序列化。
+
+    文件日志失败会抛出（调用方 log_api 装饰器已捕获）；
+    数据库写失败不影响文件日志。
+    """
     record = {
         "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "interface": interface,
@@ -77,16 +81,17 @@ def log_request(interface, method, request_params, response_params,
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
         # 2) 写数据库（结构化，方便 SQL 查询）
-        conn = sqlite3.connect(LOG_DB_PATH)
+        conn = get_conn()
         try:
-            conn.execute(
-                """INSERT INTO api_logs
-                   (interface, method, request_params, response_params,
-                    status_code, user_id, username, duration_ms)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (interface, method, req_json, resp_json,
-                 status_code, user_id, username, duration_ms),
-            )
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO api_logs
+                       (interface, method, request_params, response_params,
+                        status_code, user_id, username, duration_ms)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+                    (interface, method, req_json, resp_json,
+                     status_code, user_id, username, duration_ms),
+                )
             conn.commit()
         finally:
             conn.close()
@@ -101,18 +106,18 @@ def _dumps(obj) -> str:
 
 def query_logs(interface=None, limit=50):
     """查询最近日志（联调排查用），可按接口过滤。"""
-    conn = sqlite3.connect(LOG_DB_PATH)
-    conn.row_factory = sqlite3.Row
+    conn = get_conn()
     try:
-        if interface:
-            rows = conn.execute(
-                "SELECT * FROM api_logs WHERE interface = ? ORDER BY id DESC LIMIT ?",
-                (interface, limit),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT * FROM api_logs ORDER BY id DESC LIMIT ?", (limit,)
-            ).fetchall()
-        return [dict(r) for r in rows]
+        with conn.cursor() as cur:
+            if interface:
+                cur.execute(
+                    "SELECT * FROM api_logs WHERE interface = %s ORDER BY id DESC LIMIT %s",
+                    (interface, limit),
+                )
+            else:
+                cur.execute(
+                    "SELECT * FROM api_logs ORDER BY id DESC LIMIT %s", (limit,)
+                )
+            return cur.fetchall()
     finally:
         conn.close()
