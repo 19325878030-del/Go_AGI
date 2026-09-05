@@ -16,9 +16,10 @@
 import time
 from functools import wraps
 
-from flask import Blueprint, request, jsonify, session
+from flask import Blueprint, request, session
 
 from .schemas import RegisterParams, LoginParams
+from .response import ok, err
 from services import user_service
 from services import log_service
 
@@ -30,7 +31,7 @@ def login_required(f):
     @wraps(f)
     def wrapper(*args, **kwargs):
         if session.get('user_id') is None:
-            return jsonify({'error': '请先登录', 'code': 'UNAUTHORIZED'}), 401
+            return err('请先登录', 401)
         return f(*args, **kwargs)
     return wrapper
 
@@ -97,15 +98,15 @@ def register():
     data = request.get_json(silent=True) or {}
     params = RegisterParams.from_dict(data)
 
-    ok, msg = user_service.create_user(params.username, params.password)
-    if not ok:
-        return jsonify({'error': msg}), 400
+    success, msg = user_service.create_user(params.username, params.password)
+    if not success:
+        return err(msg, 400)
 
     # 注册成功直接登录
     user = user_service.verify_user(params.username, params.password)
     session['user_id'] = user['id']
     session['username'] = user['username']
-    return jsonify({'message': '注册成功', 'username': user['username']})
+    return ok({'username': user['username']})
 
 
 @auth_bp.route('/login', methods=['POST'])
@@ -117,11 +118,11 @@ def login():
 
     user = user_service.verify_user(params.username, params.password)
     if user is None:
-        return jsonify({'error': '用户名或密码错误'}), 401
+        return err('用户名或密码错误', 401)
 
     session['user_id'] = user['id']
     session['username'] = user['username']
-    return jsonify({'message': '登录成功', 'username': user['username']})
+    return ok({'username': user['username']})
 
 
 @auth_bp.route('/logout', methods=['POST'])
@@ -129,7 +130,7 @@ def login():
 def logout():
     """退出登录：清除 session。"""
     session.clear()
-    return jsonify({'message': '已退出登录'})
+    return ok({})
 
 
 @auth_bp.route('/me', methods=['GET'])
@@ -140,4 +141,4 @@ def me():
     user = user_service.get_user_by_id(uid) if uid else None
     if uid and user is None:
         session.clear()
-    return jsonify({'user': user})
+    return ok({'user': user})

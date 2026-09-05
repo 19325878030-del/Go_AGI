@@ -78,16 +78,34 @@ python my_ai_app\simple_app.py
 
 访问 **http://localhost:5001**（端口固定 5001，5000 被本机其他项目占用）。
 
+## 统一响应信封
+
+所有 JSON 接口统一返回 `{ code, msg, data }`：
+
+| 场景 | HTTP | body |
+|---|---|---|
+| 成功 | 200 | `{ "code": 0, "msg": "success", "data": <业务载荷> }` |
+| 错误 | 保留 4xx/5xx | `{ "code": <同数值>, "msg": <错误描述>, "data": null }` |
+
+- 前端按 `body.code === 0` 判断成功；HTTP 状态码保留（401 会触发登录弹窗）。
+- 信封 helper 在 `controllers/api/response.py`：`ok(data)` / `err(msg, code)`。
+- `GET /` 返回原生 HTML 测试页，**不进信封**。
+
 ## 接口契约
 
-| 方法 | 路径 | 请求体 | 成功响应 | 说明 |
+| 方法 | 路径 | 请求体 | 成功 `data` | 说明 |
 |---|---|---|---|---|
-| POST | `/api/chat` | `{"message", "mode": "agent\|rag\|llm", "temperature", "model"}` | `{"reply", "trace?"}` | 按模式分发；agent 模式额外返回工具调用轨迹 |
-| GET | `/api/models` | — | `{"models", "current"}` | Ollama 已装对话模型列表（自动过滤嵌入模型） |
-| POST | `/api/auth/register` | `{"username","password"}` | `200 {"message","username"}` | 注册即登录；用户名 ≥2 字符、密码 ≥6 位 |
-| POST | `/api/auth/login` | `{"username","password"}` | `200 {"message","username"}` | 失败 401 |
-| POST | `/api/auth/logout` | — | `200 {"message"}` | 清空 session |
-| GET | `/api/auth/me` | — | `200 {"user": {...}\|null}` | 页面刷新后恢复登录态 |
+| POST | `/api/chat` | `{"message","mode":"agent\|rag\|llm","temperature","model","provider_id?"}` | `{"reply","trace?"}` | 按模式分发；agent 额外返回工具调用轨迹 |
+| GET | `/api/models` | — | `{"models","current","providers","error"}` | `error` 可为 null（Ollama 拉取失败时的信息） |
+| GET | `/api/health` | — | `{"status","environment","service"}` | 健康检查（负载均衡探活） |
+| POST | `/api/auth/register` | `{"username","password"}` | `{"username"}` | 注册即登录；用户名 ≥2 字符、密码 ≥6 位 |
+| POST | `/api/auth/login` | `{"username","password"}` | `{"username"}` | 失败 401，`msg=用户名或密码错误` |
+| POST | `/api/auth/logout` | — | `{}` | 清空 session |
+| GET | `/api/auth/me` | — | `{"user": {...}\|null}` | 页面刷新后恢复登录态；未登录仍返回 200 |
+| POST | `/api/llm/providers` | `{"name?","base_url","api_key","model"}` | `{}` | 新增外部模型配置（需登录） |
+| GET | `/api/llm/providers` | — | `{"providers":[...]}` | api_key 已脱敏（需登录） |
+| DELETE | `/api/llm/providers/<id>` | — | `{}` | 删除配置（需登录） |
+| POST | `/api/llm/test` | `{"base_url","api_key","model"}` | `{"ok":bool,"message":...}` | 连通性结果：连不上也 200，看 `data.ok` |
 
 > 跨域：`flask-cors` 全局开启且 `supports_credentials=True`，前端 fetch 必须写 `credentials: 'include'`。此为联调专用写法，上线前改成明确白名单。
 
@@ -96,11 +114,11 @@ python my_ai_app\simple_app.py
 前端不在同一局域网时，把本机 5001 映射成公网地址：
 
 ```bash
-python my_ai_app\tests\subprocess.run.py
+python scripts\tunnel.py
 ```
 
 测试隧道通否：
-python my_ai_app\tests\subprocess.run.py
+python scripts\tunnel.py
 
 
 - 运行后打印公网 URL，前端 `API_BASE` 用 `.run.pinggy-free.link` 结尾那个

@@ -18,9 +18,10 @@
 /api/llm/test 的入参日志会记到 api_logs —— log_service 记录的是前端提交的原文，
 所以测试通过后建议尽快保存；日志文件在本地+TiDB，不要把它分享给别人。
 """
-from flask import Blueprint, request, jsonify, session
+from flask import Blueprint, request, session
 
 from .auth_controller import login_required, log_api
+from .response import ok, err
 from services import llm_provider_service
 
 llm_bp = Blueprint('llm', __name__, url_prefix='/api/llm')
@@ -32,7 +33,7 @@ llm_bp = Blueprint('llm', __name__, url_prefix='/api/llm')
 def list_providers():
     """当前用户的配置列表（api_key 已脱敏，如 sk****x9y2）"""
     providers = llm_provider_service.list_providers(session['user_id'])
-    return jsonify({'providers': providers})
+    return ok({'providers': providers})
 
 
 @llm_bp.route('/providers', methods=['POST'])
@@ -41,16 +42,16 @@ def list_providers():
 def add_provider():
     """新增配置。前端一般会先调 /test 验证再保存，但后端不强制。"""
     data = request.get_json(silent=True) or {}
-    ok, msg = llm_provider_service.add_provider(
+    success, msg = llm_provider_service.add_provider(
         user_id=session['user_id'],
         name=data.get('name', ''),
         base_url=data.get('base_url', ''),
         api_key=data.get('api_key', ''),
         model=data.get('model', ''),
     )
-    if not ok:
-        return jsonify({'error': msg}), 400
-    return jsonify({'message': '保存成功'})
+    if not success:
+        return err(msg, 400)
+    return ok({})
 
 
 @llm_bp.route('/providers/<int:provider_id>', methods=['DELETE'])
@@ -58,10 +59,10 @@ def add_provider():
 @log_api('/api/llm/providers/<id>')
 def delete_provider(provider_id):
     """删除配置（只能删本人的，service 层带 user_id 条件）"""
-    ok, msg = llm_provider_service.delete_provider(provider_id, session['user_id'])
-    if not ok:
-        return jsonify({'error': msg}), 404
-    return jsonify({'message': '已删除'})
+    success, msg = llm_provider_service.delete_provider(provider_id, session['user_id'])
+    if not success:
+        return err(msg, 404)
+    return ok({})
 
 
 @llm_bp.route('/test', methods=['POST'])
@@ -75,7 +76,8 @@ def test_provider():
     model = data.get('model', '')
 
     if not all([base_url, api_key, model]):
-        return jsonify({'error': 'URL、API Key、模型均不能为空'}), 400
+        return err('URL、API Key、模型均不能为空', 400)
 
-    ok, msg = llm_provider_service.test_provider(base_url, api_key, model)
-    return jsonify({'ok': ok, 'message': msg})
+    success, msg = llm_provider_service.test_provider(base_url, api_key, model)
+    # 连通性结果是"结果载荷"而非请求错误：即使连不上也返回 200 code:0，前端看 data.ok
+    return ok({'ok': success, 'message': msg})

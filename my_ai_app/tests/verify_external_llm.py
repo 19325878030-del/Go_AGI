@@ -49,24 +49,24 @@ def main():
         'base_url': f'http://127.0.0.1:{MOCK_PORT}',   # 无 name，应自动用模型名顶上
         'api_key': 'sk-mock-0000', 'model': 'mock-model'})
     assert r.status_code == 200, r.text
-    pid = [p for p in s.get(BASE + '/api/llm/providers').json()['providers']
-           if p['model'] == 'mock-model'][0]['id']
-    prov = [p for p in s.get(BASE + '/api/llm/providers').json()['providers'] if p['id'] == pid][0]
+    providers_data = s.get(BASE + '/api/llm/providers').json()['data']['providers']
+    pid = [p for p in providers_data if p['model'] == 'mock-model'][0]['id']
+    prov = [p for p in providers_data if p['id'] == pid][0]
     assert prov['name'] == 'mock-model', f"名称未自动用模型名顶上: {prov}"
     assert prov['api_key'] == 'sk****0000', f"key未脱敏: {prov['api_key']}"
     print(f'✅ 手动填url/key/model新增成功 id={pid}（名称自动=模型名，key脱敏）')
 
     # 1) 外部模型 + 直接对话 -> 应走外部并正常回复
     r = s.post(BASE + '/api/chat', json={'message': '你好', 'mode': 'llm', 'provider_id': pid})
-    d = r.json()
+    d = r.json()['data']
     assert r.status_code == 200 and 'Mock回复' in d.get('reply', ''), d
     print(f'✅ 直聊(外部): "{d["reply"]}"')
 
     # 2) 外部模型 + Agent / RAG -> 应被边界隔离拒绝（400，提示切回本地）
     for mode in ('agent', 'rag'):
         r = s.post(BASE + '/api/chat', json={'message': 'hi', 'mode': mode, 'provider_id': pid})
-        assert r.status_code == 400 and '直接对话' in r.json().get('error', ''), (mode, r.status_code, r.json())
-        print(f'✅ 外部模型 + {mode} 模式被正确拒绝: {r.json()["error"]}')
+        assert r.status_code == 400 and '直接对话' in r.json().get('msg', ''), (mode, r.status_code, r.json())
+        print(f'✅ 外部模型 + {mode} 模式被正确拒绝: {r.json()["msg"]}')
 
     # 3) mock 收到的请求确为 OpenAI 格式（消息带 user，请求带 model）
     assert received_log, 'mock未收到请求'
