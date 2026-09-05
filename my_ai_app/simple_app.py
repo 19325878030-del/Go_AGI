@@ -5,7 +5,7 @@
 import sys
 import json
 from pathlib import Path
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, render_template, request, jsonify, session
 import requests
 import os
 
@@ -40,17 +40,23 @@ CORS(app, supports_credentials=True)
 # 每个接口都会自动记录「接口 + 入参 + 出参」到：
 #   data/logs/api_requests.jsonl（联调时 tail 直接看）
 #   TiDB Cloud 的 api_logs 表（结构化，方便 SQL 查询）
-from controllers import auth_bp
+from controllers import auth_bp, llm_bp
 from services.user_service import init_db
 from services.log_service import init_log_db
+from services import llm_provider_service
 
 app.register_blueprint(auth_bp)
+app.register_blueprint(llm_bp)
 init_db()        # 建 users 表（注册数据保存到 TiDB Cloud）
 init_log_db()    # 建 api_logs 表 + logs 目录（联调日志）
+llm_provider_service.init_db()  # 建 llm_providers 表（每个用户自己的外部模型配置）
 
 # 配置
-OLLAMA_URL = "http://localhost:11434/api/generate"
-OLLAMA_BASE="http://localhost:11434"  #ollama服务根地址，用于查询模型列表
+OLLAMA_BASE = "http://localhost:11434"  # ollama 根地址，用于查询模型列表
+# Ollama 自带 OpenAI 兼容端点 /v1/chat/completions（返回结构与 DeepSeek 等一致）。
+# 直接对话统一走它 —— 本地 Ollama 也当成一个"provider"，和外部模型共用同一调用函数。
+OLLAMA_V1 = OLLAMA_BASE + "/v1"
+OLLAMA_API_KEY = "ollama"  # Ollama 不校验 key，仅占位（客户端要求非空）
 MODEL_NAME = "llama3.2:1b"  # 内存紧张时的小模型（约1GB）；内存充足可换回 "qwen2.5:3b"
 
 #当前使用的模型，运行时由/api/chat按前端选择更新
@@ -299,6 +305,73 @@ def index():
             .modal .btn-row .btn-cancel {
                 background: #9aa0a6;
             }
+            /* 外部模型管理弹窗：比登录弹窗宽一点，容纳更多输入框 */
+            .modal.wide {
+                width: 420px;
+            }
+            .modal select {
+                width: 100%;
+                padding: 10px 12px;
+                border: 1px solid #ddd;
+                border-radius: 8px;
+                font-size: 14px;
+                margin-bottom: 12px;
+                box-sizing: border-box;
+                background: white;
+            }
+            .modal .hint {
+                font-size: 12px;
+                color: #999;
+                margin-bottom: 12px;
+                line-height: 1.5;
+            }
+            .modal .success {
+                color: #27ae60;
+                font-size: 13px;
+                min-height: 18px;
+                margin-bottom: 8px;
+                text-align: center;
+                word-break: break-all;
+            }
+            .provider-list .provider-item {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                padding: 8px 10px;
+                border: 1px solid #eee;
+                border-radius: 8px;
+                margin-bottom: 8px;
+                font-size: 13px;
+            }
+            .provider-list .provider-item .del-btn {
+                background: #e74c3c;
+                color: white;
+                border: none;
+                border-radius: 6px;
+                padding: 4px 10px;
+                font-size: 12px;
+                cursor: pointer;
+            }
+            .add-llm-btn {
+                padding: 4px 10px;
+                font-size: 12px;
+                border-radius: 8px;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                color: white;
+                border: none;
+                cursor: pointer;
+                margin-left: 6px;
+            }
+            .mode-hint {
+                display: none;
+                font-size: 12px;
+                color: #e67e22;
+                margin-top: 4px;
+            }
+            label.disabled-mode {
+                opacity: 0.45;
+                cursor: not-allowed;
+            }
         </style>
     </head>
     <body>
@@ -325,10 +398,12 @@ def index():
                     💬 直接对话
                 </label>
             </div>
+            <div class="mode-hint" id="modeHint">⚠️ 外部大模型目前仅支持「直接对话」，Agent / RAG 使用本地 Ollama 模型。</div>
             <div class="controls">
                 <label>
                     模型：<select id="modelSelect"><option value="">加载中。。。</option></select>
-                </label>    
+                    <button type="button" class="add-llm-btn" onclick="showLlmModal()">➕ 外部模型</button>
+                </label>
                 <label>
                     温度: <input type="range" id="temperature" min="0" max="2" step="0.1" value="0.7" style="width:100px">
                     <span id="tempDisplay">0.7</span>
@@ -361,6 +436,28 @@ def index():
             </div>
         </div>
 
+        <!-- 外部大模型配置弹窗（需登录，配置存TiDB当前用户名下） -->
+        <div class="modal-mask" id="llmModal">
+            <div class="modal wide">
+                <h2>🔗 外部大模型</h2>
+                <div class="hint">手动填写连接信息（OpenAI兼容接口）。配置保存在你的账号下（TiDB）。</div>
+                <input type="text" id="llmBaseUrl" placeholder="API地址，如 https://api.deepseek.com">
+                <input type="text" id="llmModel" placeholder="模型名称，如 deepseek-chat">
+                <input type="password" id="llmApiKey" placeholder="API Key（sk-开头，只存你的账号）" autocomplete="off">
+                <div class="error" id="llmError"></div>
+                <div class="success" id="llmSuccess"></div>
+                <div class="btn-row">
+                    <button class="btn-cancel" onclick="testLlmProvider()">测试连接</button>
+                    <button onclick="saveLlmProvider()">保存</button>
+                </div>
+                <h2 style="font-size:16px; margin-top:20px;">已保存的配置</h2>
+                <div class="provider-list" id="providerList"></div>
+                <div class="btn-row" style="margin-top:10px;">
+                    <button class="btn-cancel" onclick="hideLlmModal()">关闭</button>
+                </div>
+            </div>
+        </div>
+
         <script>
             const chatBox = document.getElementById('chatBox');
             const userInput = document.getElementById('userInput');
@@ -369,27 +466,71 @@ def index():
             const tempDisplay = document.getElementById('tempDisplay');
             const status = document.getElementById('status');
             const modelSelect = document.getElementById('modelSelect'); 
-            //页面加载时获取ollama已安装的模型列表
+            //页面加载时获取模型列表（本地Ollama + 已登录用户的外部模型配置）
             async function loadModels(){
                 try{
                     const response = await fetch('/api/models');
                     const data = await response.json();
-                    modelSelect.innerHTML = '';
-                    (data.models || []).forEach(name =>{
-                        const option =document.createElement('option');
-                        option.value =name;
-                        option.textContent = name;
-                        modelSelect.appendChild(option);
-                    });
-                    if(data.current &&data.models.includes(data.current)){
-                    modelSelect.value = data.current;
+                    renderModelSelect(data.models || [], data.providers || []);
+                    // 恢复/改变选择后同步一次模式可选项
+                    updateModeByModel();
+                    const localCount = (data.models || []).length;
+                    const extCount = (data.providers || []).length;
+                    if (localCount === 0 && extCount === 0) {
+                        status.textContent = '⚠️ 本地Ollama未启动，也暂无外部模型（点"➕ 外部模型"添加）';
+                    } else {
+                        status.textContent = '✅ 服务运行中：本地 ' + localCount + ' 个 / 外部 ' + extCount + ' 个模型';
                     }
-                    status.textContent = data.models.length > 0
-                        ? '✅ 服务运行中，已加载 ' + data.models.length + ' 个模型'
-                        : '⚠️ 未获取到模型，请确认Ollama已启动';
                 } catch (e) {
                     status.textContent = '⚠️ 获取模型列表失败: ' + e.message;
                 }
+            }
+
+            // 渲染模型下拉框：本地一组、外部一组（外部value用 ext:{id} 标识）
+            function renderModelSelect(localModels, providers){
+                // 记住当前选择，重渲染后尽量恢复
+                const prev = modelSelect.value;
+                modelSelect.innerHTML = '';
+
+                const localGroup = document.createElement('optgroup');
+                localGroup.label = '本地 Ollama';
+                localModels.forEach(name =>{
+                    const option =document.createElement('option');
+                    option.value =name;
+                    option.textContent = name;
+                    localGroup.appendChild(option);
+                });
+                modelSelect.appendChild(localGroup);
+
+                const extGroup = document.createElement('optgroup');
+                extGroup.label = '外部大模型';
+                providers.forEach(p =>{
+                    const option = document.createElement('option');
+                    option.value = 'ext:' + p.id;
+                    // 名称与模型名相同（未单独命名）时只显示模型名，避免重复
+                    option.textContent = (p.name && p.name !== p.model)
+                        ? p.name + '（' + p.model + '）'
+                        : p.model;
+                    extGroup.appendChild(option);
+                });
+                if (providers.length === 0) {
+                    const option = document.createElement('option');
+                    option.value = '';
+                    option.textContent = '未添加（点右侧➕）';
+                    option.disabled = true;
+                    extGroup.appendChild(option);
+                }
+                modelSelect.appendChild(extGroup);
+
+                // 恢复之前的选择（选项还在时）
+                if (prev && modelSelect.querySelector('option[value="' + prev + '"]')) {
+                    modelSelect.value = prev;
+                }
+            }
+
+            // 登录状态变化后刷新（外部模型配置跟登录用户绑定）
+            function refreshModelsAfterAuth(){
+                loadModels();
             }
             loadModels();
 
@@ -397,6 +538,23 @@ def index():
                 const checked = document.querySelector('input[name="mode"]:checked');
                 return checked ? checked.value : 'agent';
             }
+
+            // 模式与模型的边界：外部大模型只接「直接对话」，Agent/RAG 仅用本地模型
+            const modeAgentRadio = document.getElementById('modeAgent');
+            const modeRagRadio = document.getElementById('modeRag');
+            const modeLlmRadio = document.getElementById('modeLlm');
+            const modeHintEl = document.getElementById('modeHint');
+
+            function updateModeByModel() {
+                const isExternal = (modelSelect.value || '').startsWith('ext:');
+                modeAgentRadio.disabled = isExternal;
+                modeRagRadio.disabled = isExternal;
+                modeHintEl.style.display = isExternal ? 'block' : 'none';
+                // 选了外部模型时强制切到「直接对话」
+                if (isExternal && !modeLlmRadio.checked) modeLlmRadio.checked = true;
+            }
+
+            modelSelect.addEventListener('change', updateModeByModel);
 
             let isProcessing = false;
 
@@ -429,7 +587,9 @@ def index():
                 status.innerHTML = '<span class="loading"></span> 思考中...';
 
                 try {
-                    // 调用后端API
+                    // 选中 ext:<id> 时走外部模型（带provider_id），否则走本地Ollama（带model）
+                    const sel = modelSelect.value;
+                    const isExternal = sel.startsWith('ext:');
                     const response = await fetch('/api/chat', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
@@ -437,7 +597,8 @@ def index():
                             message: message,
                             mode: getMode(),
                             temperature: parseFloat(temperature.value),
-                            model:modelSelect.value
+                            model: isExternal ? null : sel,
+                            provider_id: isExternal ? parseInt(sel.slice(4), 10) : null
                         })
                     });
 
@@ -597,6 +758,153 @@ def index():
                     authToggleBtn.textContent = '登录 / 注册';
                     authToggleBtn.onclick = showAuthModal;
                 }
+                // 登录态变了，外部模型配置也变了（跟登录用户绑定），刷新下拉框
+                refreshModelsAfterAuth();
+            }
+
+            // ==================== 外部大模型配置 ====================
+            // 依赖后端 controllers/api/llm_controller.py：
+            //   连接信息（url/模型名/密钥）由操作者手动填写，不预设服务商
+            //   GET  /api/llm/providers      → 当前用户已存配置（key脱敏）
+            //   POST /api/llm/providers      → 新增 {base_url, api_key, model}
+            //   DELETE /api/llm/providers/id → 删除
+            //   POST /api/llm/test           → 连通性测试
+            const llmModal = document.getElementById('llmModal');
+            const llmBaseUrl = document.getElementById('llmBaseUrl');
+            const llmModel = document.getElementById('llmModel');
+            const llmApiKey = document.getElementById('llmApiKey');
+            const llmError = document.getElementById('llmError');
+            const llmSuccess = document.getElementById('llmSuccess');
+            const providerList = document.getElementById('providerList');
+
+            async function showLlmModal() {
+                // 配置存登录用户名下，未登录先去登录
+                try {
+                    const me = await fetch('/api/auth/me').then(r => r.json());
+                    if (!me.user) {
+                        alert('外部模型配置需要先登录（配置保存在你的账号下）');
+                        showAuthModal();
+                        return;
+                    }
+                } catch (e) { /* 查询失败也允许打开弹窗，保存时后端会再拦 */ }
+
+                llmError.textContent = '';
+                llmSuccess.textContent = '';
+                // 打开时清空输入框，避免沿用上一次填的连接信息
+                llmBaseUrl.value = '';
+                llmModel.value = '';
+                llmApiKey.value = '';
+                llmModal.classList.add('show');
+                await loadProviderList();
+            }
+
+            function hideLlmModal() {
+                llmModal.classList.remove('show');
+            }
+
+            llmModal.addEventListener('click', function (e) {
+                if (e.target === llmModal) hideLlmModal();
+            });
+
+            // 采集表单：url + 模型名 + api key，名称留空由后端用模型名顶上
+            function collectLlmForm() {
+                return {
+                    base_url: llmBaseUrl.value.trim(),
+                    model: llmModel.value.trim(),
+                    api_key: llmApiKey.value.trim()
+                };
+            }
+
+            async function testLlmProvider() {
+                const form = collectLlmForm();
+                llmError.textContent = '';
+                llmSuccess.textContent = '⏳ 测试中...';
+                try {
+                    const response = await fetch('/api/llm/test', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(form)
+                    });
+                    const data = await response.json();
+                    if (data.ok) {
+                        llmSuccess.textContent = '✅ ' + data.message;
+                    } else {
+                        llmError.textContent = '❌ ' + (data.message || data.error);
+                        llmSuccess.textContent = '';
+                    }
+                } catch (e) {
+                    llmError.textContent = '请求失败: ' + e.message;
+                    llmSuccess.textContent = '';
+                }
+            }
+
+            async function saveLlmProvider() {
+                const form = collectLlmForm();
+                if (!form.base_url || !form.model || !form.api_key) {
+                    llmError.textContent = 'URL、模型名称、API Key 都要填';
+                    llmSuccess.textContent = '';
+                    return;
+                }
+                llmError.textContent = '';
+                llmSuccess.textContent = '⏳ 保存中...';
+                try {
+                    const response = await fetch('/api/llm/providers', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(form)
+                    });
+                    const data = await response.json();
+                    if (!response.ok) {
+                        llmError.textContent = data.error || '保存失败';
+                        llmSuccess.textContent = '';
+                        return;
+                    }
+                    llmSuccess.textContent = '✅ 已保存';
+                    llmApiKey.value = '';
+                    await Promise.all([loadProviderList(), loadModels()]);
+                } catch (e) {
+                    llmError.textContent = '请求失败: ' + e.message;
+                    llmSuccess.textContent = '';
+                }
+            }
+
+            async function loadProviderList() {
+                try {
+                    const response = await fetch('/api/llm/providers');
+                    if (response.status === 401) {
+                        providerList.innerHTML = '<div class="hint">未登录，暂无配置</div>';
+                        return;
+                    }
+                    const data = await response.json();
+                    providerList.innerHTML = '';
+                    (data.providers || []).forEach(p => {
+                        const item = document.createElement('div');
+                        item.className = 'provider-item';
+
+                        const info = document.createElement('div');
+                        const title = (p.name && p.name !== p.model) ? p.name : p.model;
+                        info.innerHTML = '<strong>' + title + '</strong><br>' +
+                            '<span style="color:#999">' + p.model + ' · ' + p.api_key + '</span>';
+
+                        const delBtn = document.createElement('button');
+                        delBtn.className = 'del-btn';
+                        delBtn.textContent = '删除';
+                        delBtn.onclick = async () => {
+                            if (!confirm('删除配置「' + title + '」？')) return;
+                            await fetch('/api/llm/providers/' + p.id, { method: 'DELETE' });
+                            await Promise.all([loadProviderList(), loadModels()]);
+                        };
+
+                        item.appendChild(info);
+                        item.appendChild(delBtn);
+                        providerList.appendChild(item);
+                    });
+                    if ((data.providers || []).length === 0) {
+                        providerList.innerHTML = '<div class="hint">还没有保存的配置</div>';
+                    }
+                } catch (e) {
+                    providerList.innerHTML = '<div class="hint">加载失败: ' + e.message + '</div>';
+                }
             }
 
             // 页面加载完成后恢复登录状态（放在末尾，确保上面的DOM引用已初始化）
@@ -610,28 +918,50 @@ def index():
 #插入新路由,新增 /api/models 接口
 @app.route('/api/models',methods=['GET'])
 def list_models():
-    """返回ollama已安装的模型列表"""
+    """返回可选模型列表：本地Ollama已安装的 + 当前用户保存的外部模型配置"""
+    # 本地Ollama部分
+    local_models = []
+    ollama_error = None
     try:
         response=requests.get(f"{OLLAMA_BASE}/api/tags",timeout=5)
         response.raise_for_status()
         data=response.json()
         # 过滤嵌入模型（如nomic-embed-text）：family是bert类或名字带embed的
         # 只能算向量不能对话，选它调generate会被Ollama拒绝(400)
-        models = [
+        local_models = [
             m['name'] for m in data.get('models', [])
             if 'embed' not in m['name'] and 'bert' not in m.get('details', {}).get('family', '')
         ]
-
-        return jsonify({'models':models,'current':_current_model})
     except Exception as e:
-        return jsonify({'models':[],'current':_current_model,'error':str(e)})
+        ollama_error = str(e)
+
+    # 外部模型部分：登录用户自己在 /api/llm 保存的配置（api_key已脱敏）
+    providers = []
+    uid = session.get('user_id')
+    if uid:
+        try:
+            providers = llm_provider_service.list_providers(uid)
+        except Exception as e:
+            print(f"⚠️ 读取外部模型配置失败: {e}")
+
+    return jsonify({
+        'models': local_models,
+        'current': _current_model,
+        'providers': providers,          # [{id,name,base_url,api_key(脱敏),model}]
+        'error': ollama_error
+    })
 
 
 
 
 @app.route('/api/chat', methods=['POST'])
 def chat():
-    """聊天API"""
+    """聊天API
+
+    当前三种模式相互独立（后续要加的"并行模式"再统一编排）：
+      - rag / agent：只能走本地 Ollama（单例模型与工具调用基于本地模型）
+      - llm 直接对话：可选本地 Ollama，或外部大模型（provider_id）
+    """
     global _rag_system, _agent_instance, _current_model
     try:
         data = request.json
@@ -639,14 +969,31 @@ def chat():
         mode = data.get('mode', 'agent')  # agent / rag / llm
         temperature = data.get('temperature', 0.7)
         model=data.get('model') or MODEL_NAME
+        # 外部模型：前端选了 "ext:<id>" 时携带 provider_id，优先级高于本地model
+        provider_id = data.get('provider_id')
 
-        #模型变化时丢弃旧例，rag和agent下次调用会用新模型重建
+        # 走外部模型：先取本人配置（含完整api_key），取不到说明未登录/配置被删
+        provider = None
+        if provider_id is not None:
+            uid = session.get('user_id')
+            if uid is None:
+                return jsonify({'error': '使用外部模型需要先登录', 'code': 'UNAUTHORIZED'}), 401
+            provider = llm_provider_service.get_provider_by_id(provider_id, uid)
+            if provider is None:
+                return jsonify({'error': '外部模型配置不存在，请重新选择或添加'}), 400
+
+            # 外部模型目前只接"直接对话"，不接 Agent/RAG（等并行模式再做编排）
+            if mode in ('rag', 'agent'):
+                return jsonify({'error': '外部模型目前仅支持「直接对话」模式；'
+                                        'Agent / RAG 请先把模型切回本地再使用'}), 400
+
+        # 本地模型变化时丢弃旧例，rag和agent下次调用会用新模型重建。
+        # （外部直接对话无状态，不影响这里的单例）
         if model != _current_model:
             _rag_system=None
             _agent_instance=None
             _current_model =model
             print(f"🔄 切换模型:{model}")
-
 
         if not message:
             return jsonify({'error': '请输入问题'})
@@ -660,31 +1007,34 @@ def chat():
             reply, trace = chat_with_agent(message)
             return jsonify({'reply': reply, 'trace': trace})
 
-        # 默认直接调用LLM
-        reply = chat_with_llm(message, temperature)
+        # 默认直接对话：本地与外部统一走 chat_openai_compatible()
+        #   - 选了外部模型(provider) -> 直接用其 base_url/api_key/model
+        #   - 没选(本地) -> chat_with_llm 内部把 Ollama 也注册成 /v1 的 provider
+        if provider:
+            reply = llm_provider_service.chat_openai_compatible(provider, message, temperature)
+        else:
+            reply = chat_with_llm(message, temperature)
         return jsonify({'reply': reply})
 
     except Exception as e:
         return jsonify({'error': str(e)})
 
 
-def chat_with_llm(message, temperature,model=None):
-    """直接调用LLM"""
-    model = model or _current_model # 未显式传入时用当前选中模型
-    payload = {
-        "model": model,
-        "prompt": message,
-        "stream": False,
-        "options": {
-            "temperature": temperature
-        }
-    }
+def chat_with_llm(message, temperature, model=None):
+    """直接对话（本地 Ollama）—— 与外部模型走同一个 OpenAI 兼容调用函数。
 
+    把本地 Ollama 也注册成一个 provider：
+        {base_url: http://localhost:11434/v1, api_key: "ollama", model: 本地模型}
+    然后调 llm_provider_service.chat_openai_compatible() —— 和外部 DeepSeek 走同一入口。
+    """
+    model = model or _current_model  # 未显式传入时用当前选中模型
+    local_provider = {
+        "base_url": OLLAMA_V1,
+        "api_key": OLLAMA_API_KEY,
+        "model": model,
+    }
     try:
-        response = requests.post(OLLAMA_URL, json=payload, timeout=60)
-        response.raise_for_status()
-        result = response.json()
-        return result.get('response', '抱歉，我没有理解你的问题')
+        return llm_provider_service.chat_openai_compatible(local_provider, message, temperature)
     except Exception as e:
         return f'调用LLM失败: {str(e)}'
 
