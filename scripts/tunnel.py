@@ -1,4 +1,4 @@
-# my_ai_app/tests/subprocess.run.py
+# scripts/tunnel.py
 """
 内网穿透隧道启动脚本（Pinggy 免费版）。
 
@@ -6,7 +6,7 @@
 其他电脑/手机（不在同一局域网）就能直接调你的接口调试。
 
 用法（在项目根目录、激活 .venv 后运行）：
-    python my_ai_app/tests/subprocess.run.py
+    python scripts/tunnel.py
 
 运行后会打印两个 URL，前端 API_BASE 用 .run.pinggy-free.link 结尾那个。
 
