@@ -11,6 +11,7 @@ AI 助手后端 —— 应用工厂（Application Factory）入口。
 """
 import os
 import sys
+import time
 from pathlib import Path
 
 import requests
@@ -53,6 +54,9 @@ MODEL_NAME = "llama3.2:1b"  # 内存紧张时的小模型（约1GB）；内存�
 
 # 当前使用的模型，运行时由 /api/chat 按前端选择更新
 _current_model = MODEL_NAME
+
+# RAG 向量库持久化目录（本地 Chroma）；知识库按 collection_name 命名，由前端参数选择
+RAG_PERSIST_DIR = str(BASE_DIR / "data" / "chroma_db")
 
 
 # ==================== 简单测试前端页面（前端代码已全部内联于此） ====================
@@ -389,11 +393,15 @@ INDEX_HTML = '''
                     💬 直接对话
                 </label>
             </div>
-            <div class="mode-hint" id="modeHint">⚠️ 外部大模型目前仅支持「直接对话」，Agent / RAG 使用本地 Ollama 模型。</div>
+            <div class="mode-hint" id="modeHint">⚠️ Agent 模式仅支持本地 Ollama 模型；RAG 与直接对话可选本地或外部大模型（外部需登录）。</div>
             <div class="controls">
                 <label>
                     模型：<select id="modelSelect"><option value="">加载中。。。</option></select>
                     <button type="button" class="add-llm-btn" onclick="showLlmModal()">➕ 外部模型</button>
+                </label>
+                <label>
+                    知识库(向量库)：<select id="ragCollectionSelect"><option value="">加载中...</option></select>
+                    <button type="button" class="add-llm-btn" onclick="showIngestModal()">⬆ 上传建库</button>
                 </label>
                 <label>
                     温度: <input type="range" id="temperature" min="0" max="2" step="0.1" value="0.7" style="width:100px">
@@ -449,6 +457,26 @@ INDEX_HTML = '''
             </div>
         </div>
 
+        <!-- 上传文档生成知识库弹窗：multipart 上传到 POST /api/rag/collections -->
+        <div class="modal-mask" id="ingestModal">
+            <div class="modal wide">
+                <h2>⬆ 上传文档建库</h2>
+                <div class="hint">
+                    选文件生成向量知识库（存本机 data/chroma_db）。支持 txt / md / pdf / docx。<br>
+                    同名知识库重复上传 = 增量入库，同名文件覆盖旧内容不重复。
+                </div>
+                <input type="text" id="ingestCollectionName" placeholder="知识库名称（如：公司制度）">
+                <input type="file" id="ingestFiles" multiple
+                       accept=".txt,.md,.pdf,.docx" style="margin-bottom:12px; font-size:13px; color:#666;">
+                <div class="error" id="ingestError"></div>
+                <div class="success" id="ingestSuccess"></div>
+                <div class="btn-row">
+                    <button id="ingestSubmitBtn" onclick="doIngest()">开始入库</button>
+                    <button class="btn-cancel" onclick="hideIngestModal()">关闭</button>
+                </div>
+            </div>
+        </div>
+
         <script>
             const chatBox = document.getElementById('chatBox');
             const userInput = document.getElementById('userInput');
@@ -457,6 +485,7 @@ INDEX_HTML = '''
             const tempDisplay = document.getElementById('tempDisplay');
             const status = document.getElementById('status');
             const modelSelect = document.getElementById('modelSelect');
+            const ragCollectionSelect = document.getElementById('ragCollectionSelect');
 
             // 统一响应信封：所有数据接口返回 {code,msg,data}；code===0 成功，否则 data=null、msg=错误文本。
             // HTTP 状态码保留（401 触发登录弹窗）。unwrap 把响应解包成 {code,msg,data} 便于取用。
@@ -537,30 +566,134 @@ INDEX_HTML = '''
                 }
             }
 
-            // 登录状态变化后刷新（外部模型配置跟登录用户绑定）
+            // 登录状态变化后刷新（外部模型配置跟登录用户绑定；知识库是本机数据，一并刷新）
             function refreshModelsAfterAuth(){
                 loadModels();
+                loadRagCollections();
             }
             loadModels();
+
+            // 列出本机已有知识库：RAG 模式用，选中项的 name 作为 collection_name 传给 /api/chat
+            // 接口返回 [{name: 合法集合名, display_name: 显示名, count: 块数}]
+            async function loadRagCollections(selectName) {
+                const prev = selectName || ragCollectionSelect.value;
+                try {
+                    const response = await fetch('/api/rag/collections');
+                    const r = await unwrap(response);
+                    const cols = (r.data && r.data.collections) || [];
+                    ragCollectionSelect.innerHTML = '';
+                    if (cols.length === 0) {
+                        const opt = document.createElement('option');
+                        opt.value = '';
+                        opt.textContent = '暂无知识库（需先上传文档）';
+                        opt.disabled = true;
+                        ragCollectionSelect.appendChild(opt);
+                    } else {
+                        cols.forEach(c => {
+                            const opt = document.createElement('option');
+                            opt.value = c.name;
+                            // 显示名与合法名相同（纯英文数字库名）时只显示一个
+                            opt.textContent = (c.display_name && c.display_name !== c.name)
+                                ? c.display_name + '（' + c.count + '块）'
+                                : c.name + '（' + c.count + '块）';
+                            ragCollectionSelect.appendChild(opt);
+                        });
+                    }
+                    // 恢复之前的选择 / 选中刚建好的库（选项还在时）
+                    if (prev && ragCollectionSelect.querySelector('option[value="' + prev + '"]')) {
+                        ragCollectionSelect.value = prev;
+                    }
+                } catch (e) {
+                    ragCollectionSelect.innerHTML = '';
+                    const opt = document.createElement('option');
+                    opt.value = '';
+                    opt.textContent = '知识库加载失败';
+                    opt.disabled = true;
+                    ragCollectionSelect.appendChild(opt);
+                }
+            }
+            loadRagCollections();
+
+            // ==================== 上传文档建库 ====================
+            // 依赖后端 POST /api/rag/collections（multipart）：
+            //   collection_name=库名（中文可） + files=文档列表
+            // 成功后刷新下拉并选中新库，之后 RAG 模式直接选它提问
+            const ingestModal = document.getElementById('ingestModal');
+            const ingestCollectionName = document.getElementById('ingestCollectionName');
+            const ingestFiles = document.getElementById('ingestFiles');
+            const ingestError = document.getElementById('ingestError');
+            const ingestSuccess = document.getElementById('ingestSuccess');
+            const ingestSubmitBtn = document.getElementById('ingestSubmitBtn');
+
+            function showIngestModal() {
+                ingestError.textContent = '';
+                ingestSuccess.textContent = '';
+                ingestCollectionName.value = '';
+                ingestFiles.value = '';
+                ingestModal.classList.add('show');
+                ingestCollectionName.focus();
+            }
+
+            function hideIngestModal() {
+                ingestModal.classList.remove('show');
+            }
+
+            ingestModal.addEventListener('click', function (e) {
+                if (e.target === ingestModal) hideIngestModal();
+            });
+
+            async function doIngest() {
+                const name = ingestCollectionName.value.trim();
+                const files = ingestFiles.files;
+                if (!name) { ingestError.textContent = '请填写知识库名称'; return; }
+                if (!files || files.length === 0) { ingestError.textContent = '请选择至少一个文件'; return; }
+
+                const formData = new FormData();
+                formData.append('collection_name', name);
+                for (let i = 0; i < files.length; i++) formData.append('files', files[i]);
+
+                ingestError.textContent = '';
+                ingestSuccess.textContent = '⏳ 入库中（嵌入计算需要一些时间）...';
+                ingestSubmitBtn.disabled = true;
+                try {
+                    const response = await fetch('/api/rag/collections', { method: 'POST', body: formData });
+                    const r = await unwrap(response);
+                    if (r.code !== 0) {
+                        ingestError.textContent = '❌ ' + (r.msg || '入库失败');
+                        ingestSuccess.textContent = '';
+                        return;
+                    }
+                    const data = r.data || {};
+                    const failed = (data.files || []).filter(f => !f.ok);
+                    let msg = '✅ 库「' + data.display_name + '」共入库 ' + data.total_chunks + ' 块';
+                    if (failed.length) msg += '；未入库: ' + failed.map(f => f.file).join('、');
+                    ingestSuccess.textContent = msg;
+                    // 刷新下拉并选中刚建的库（用合法集合名选中）
+                    await loadRagCollections(data.collection);
+                } catch (e) {
+                    ingestError.textContent = '请求失败: ' + e.message;
+                    ingestSuccess.textContent = '';
+                } finally {
+                    ingestSubmitBtn.disabled = false;
+                }
+            }
 
             function getMode() {
                 const checked = document.querySelector('input[name="mode"]:checked');
                 return checked ? checked.value : 'agent';
             }
 
-            // 模式与模型的边界：外部大模型只接「直接对话」，Agent/RAG 仅用本地模型
+            // 模式与模型的边界：外部大模型可用于「直接对话」和 RAG；仅 Agent 依赖本地 Ollama 工具调用
             const modeAgentRadio = document.getElementById('modeAgent');
-            const modeRagRadio = document.getElementById('modeRag');
             const modeLlmRadio = document.getElementById('modeLlm');
             const modeHintEl = document.getElementById('modeHint');
 
             function updateModeByModel() {
                 const isExternal = (modelSelect.value || '').startsWith('ext:');
                 modeAgentRadio.disabled = isExternal;
-                modeRagRadio.disabled = isExternal;
                 modeHintEl.style.display = isExternal ? 'block' : 'none';
-                // 选了外部模型时强制切到「直接对话」
-                if (isExternal && !modeLlmRadio.checked) modeLlmRadio.checked = true;
+                // 选了外部模型时，若还停在 Agent 上则强制切到「直接对话」；RAG 可用外部模型，保持不变
+                if (isExternal && modeAgentRadio.checked) modeLlmRadio.checked = true;
             }
 
             modelSelect.addEventListener('change', updateModeByModel);
@@ -586,6 +719,14 @@ INDEX_HTML = '''
                 const message = userInput.value.trim();
                 if (!message) return;
 
+                const ragMode = getMode() === 'rag';
+                // RAG 模式必须选中知识库（向量库），名字作为 collection_name 传给后端
+                if (ragMode && !ragCollectionSelect.value) {
+                    status.textContent = '⚠️ 请先选择知识库（向量库）再提问';
+                    userInput.focus();
+                    return;
+                }
+
                 // 显示用户消息
                 addMessage('user', message);
                 userInput.value = '';
@@ -607,7 +748,9 @@ INDEX_HTML = '''
                             mode: getMode(),
                             temperature: parseFloat(temperature.value),
                             model: isExternal ? null : sel,
-                            provider_id: isExternal ? parseInt(sel.slice(4), 10) : null
+                            provider_id: isExternal ? parseInt(sel.slice(4), 10) : null,
+                            // RAG 模式：用前端选中的知识库名
+                            collection_name: ragMode ? ragCollectionSelect.value : null
                         })
                     });
 
@@ -953,46 +1096,36 @@ def chat_with_llm(message, temperature, model=None):
 
 
 # ==================== RAG支持 ====================
-# 懒加载的全局RAG实例：首次调用时初始化（加载嵌入模型+建向量库耗时），
-# 后续请求复用，避免每个请求重建
-_rag_system = None
+# 轻量单例只持有本地嵌入模型（检索用）；生成模型每次按前端选择走 provider、无状态，
+# 所以切换对话模型时无需像 Agent 那样重建本单例。
+_rag_service = None
 
 
-def get_rag_system():
-    """获取（必要时初始化）RAG系统单例"""
-    global _rag_system
-    if _rag_system is None:
-        from modules.rag.rag_demo import RAGSystem
+def get_rag_service():
+    """获取（必要时初始化）RAG服务单例 —— 只含向量库管理与本地嵌入模型"""
+    global _rag_service
+    if _rag_service is None:
+        from modules.rag.rag_service import RAGService
 
-        rag = RAGSystem(model_name=_current_model)
-        sample_path = BASE_DIR / "data" / "sample.txt"
-
-        if not sample_path.exists():
-            raise FileNotFoundError(f"知识库文档不存在: {sample_path}")
-
-        # 优先加载已有向量库；没有或损坏则从文档重建
-        try:
-            rag.load_vectorstore()
-        except Exception:
-            documents = rag.load_documents(str(sample_path))
-            rag.create_vectorstore(documents)
-
-        rag.setup_qa_chain(k=3)
-        _rag_system = rag
-    return _rag_system
+        _rag_service = RAGService(persist_dir=RAG_PERSIST_DIR)
+    return _rag_service
 
 
-def chat_with_rag(message, temperature):
-    """使用RAG系统回答（基于data/sample.txt知识库）"""
+def chat_with_rag(message, provider, collection_name, temperature=0.7):
+    """使用前端指定的命名向量库回答（provider 为本地或外部模型配置）。
+
+    检索/向量库异常时降级为普通直接对话，保证前端始终有回复。
+    """
+    rag = get_rag_service()
+
+    def generate(prompt):
+        return llm_provider_service.chat_openai_compatible(provider, prompt, temperature)
+
     try:
-        rag = get_rag_system()
-        result = rag.ask(message)
-        return result.get('answer', '抱歉，没有找到答案')
-
+        return rag.ask(collection_name, message, generate).get('answer', '抱歉，没有找到答案')
     except Exception as e:
         print(f"RAG错误: {e}")
-        # 降级到普通LLM，保证前端始终有回复
-        return chat_with_llm(message, temperature)
+        return llm_provider_service.chat_openai_compatible(provider, message, temperature)
 
 
 # ==================== Agent支持 ====================
@@ -1127,16 +1260,90 @@ def _register_inline_routes(app):
             'error': ollama_error,           # 可为 null：Ollama 拉取失败时的信息，不影响整体成功
         })
 
+    # ==================== 知识库列表 /api/rag/collections ====================
+    @app.route('/api/rag/collections', methods=['GET'])
+    def list_rag_collections():
+        """列出本机已有知识库（向量库）。
+
+        前端据此填充知识库下拉，聊天（RAG 模式）时把选中的名字作为 collection_name
+        传给 /api/chat。返回 [{name, display_name, count}]；读取失败不报错，返回空列表 + error。
+        """
+        from modules.rag.rag_ingest import list_collections as ingest_list
+        try:
+            cols = ingest_list(RAG_PERSIST_DIR)
+        except Exception as e:
+            print(f"⚠️ 读取RAG向量库列表失败: {e}")
+            return ok({'collections': [], 'error': str(e)})
+        return ok({'collections': cols})
+
+    # ==================== 上传文档建库 /api/rag/collections ====================
+    @app.route('/api/rag/collections', methods=['POST'])
+    def create_rag_collection():
+        """接收前端上传的文档并生成向量库（multipart/form-data）。
+
+        表单字段：
+            collection_name: 库名（中文可；同库名重复上传=增量入库，同文件覆盖不重复）
+            files: 文件列表，支持 .txt/.md/.pdf/.docx
+        文件先落到 data/uploads/ 临时目录再入库，入库完成后删除。
+        """
+        import tempfile
+        from modules.rag.rag_ingest import ingest_documents, SUPPORTED_EXTS
+
+        collection_name = (request.form.get('collection_name') or '').strip()
+        files = request.files.getlist('files')
+        if not collection_name:
+            return err('请填写知识库名称', 400)
+        if not files or all(f.filename == '' for f in files):
+            return err('请选择至少一个文件', 400)
+
+        # 扩展名白名单预检（不合法直接拒绝，不让它进临时目录）
+        for f in files:
+            ext = Path(f.filename).suffix.lower()
+            if ext not in SUPPORTED_EXTS:
+                return err(f'不支持的格式「{f.filename}」，仅支持 {" ".join(SUPPORTED_EXTS)}', 400)
+
+        # 落盘到临时目录 → 入库 → 清理（无论成败）
+        # 每次上传单独一个时间戳子目录：文件保留原始名（入库元数据可溯源），并发互不干扰
+        upload_dir = Path(RAG_PERSIST_DIR).parent / 'uploads' / str(int(time.time() * 1000))
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        saved_paths = []
+        try:
+            for f in files:
+                dest = upload_dir / Path(f.filename).name  # .name 剥掉路径部分，防目录穿越
+                f.save(dest)
+                saved_paths.append(dest)
+
+            result = ingest_documents(collection_name, saved_paths, persist_dir=RAG_PERSIST_DIR)
+        except ValueError as e:
+            return err(str(e), 400)
+        except Exception as e:
+            print(f"⚠️ 文档入库失败: {e}")
+            return err(f'入库失败: {e}', 500)
+        finally:
+            # 清理本次上传的临时子目录（含未入库成功残留的文件）
+            import shutil
+            shutil.rmtree(upload_dir, ignore_errors=True)
+
+        return ok({
+            'collection': result['collection'],      # 合法集合名（slug 化后）
+            'display_name': result['display_name'],  # 用户可见库名
+            'total_chunks': result['total_chunks'],
+            'files': [{'file': s['file'], 'chunks': s['chunks'],
+                       'ok': s['ok'], 'error': s['error']} for s in result['files']],
+        })
+
     # ==================== 聊天 /api/chat ====================
     @app.route('/api/chat', methods=['POST'])
     def chat():
         """聊天API
 
-        当前三种模式相互独立（后续要加的"并行模式"再统一编排）：
-          - rag / agent：只能走本地 Ollama（单例模型与工具调用基于本地模型）
+        三种模式相互独立（后续要加的"并行模式"再统一编排）：
+          - rag：用前端指定的向量库（collection_name）检索，生成模型 = 前端当前所选
+            （本地 Ollama 或外部大模型皆可，检索仍用本地嵌入模型）
+          - agent：只能走本地 Ollama（工具调用基于本地模型与单例）
           - llm 直接对话：可选本地 Ollama，或外部大模型（provider_id）
         """
-        global _rag_system, _agent_instance, _current_model
+        global _agent_instance, _current_model
         try:
             data = request.json
             message = data.get('message', '')
@@ -1146,7 +1353,8 @@ def _register_inline_routes(app):
             # 外部模型：前端选了 "ext:<id>" 时携带 provider_id，优先级高于本地model
             provider_id = data.get('provider_id')
 
-            # 走外部模型：先取本人配置（含完整api_key），取不到说明未登录/配置被删
+            # 走外部模型：先取本人配置（含完整api_key），取不到说明未登录/配置被删。
+            # 外部模型可用于「直接对话」和 RAG 生成；Agent 依赖本地 Ollama 工具调用，仍不支持。
             provider = None
             if provider_id is not None:
                 uid = session.get('user_id')
@@ -1155,16 +1363,13 @@ def _register_inline_routes(app):
                 provider = llm_provider_service.get_provider_by_id(provider_id, uid)
                 if provider is None:
                     return err('外部模型配置不存在，请重新选择或添加', 400)
+                if mode == 'agent':
+                    return err('外部模型目前仅支持「直接对话」和 RAG 模式；'
+                               'Agent 请先把模型切回本地再使用', 400)
 
-                # 外部模型目前只接"直接对话"，不接 Agent/RAG（等并行模式再做编排）
-                if mode in ('rag', 'agent'):
-                    return err('外部模型目前仅支持「直接对话」模式；'
-                               'Agent / RAG 请先把模型切回本地再使用', 400)
-
-            # 本地模型变化时丢弃旧例，rag和agent下次调用会用新模型重建。
-            # （外部直接对话无状态，不影响这里的单例）
+            # 本地模型变化时丢弃旧 Agent 单例，下次调用会用新模型重建。
+            # RAG 生成按请求走 provider、无状态，检索只依赖固定的本地嵌入模型，无需重建。
             if model != _current_model:
-                _rag_system = None
                 _agent_instance = None
                 _current_model = model
                 print(f"🔄 切换模型:{model}")
@@ -1174,7 +1379,21 @@ def _register_inline_routes(app):
 
             # 根据前端选择的模式分发
             if mode == 'rag':
-                reply = chat_with_rag(message, temperature)
+                # 用哪个向量库（知识库）由前端参数决定，例：文档上传后返回的 collection_name
+                collection_name = (data.get('collection_name') or '').strip()
+                if not collection_name:
+                    return err('请先选择知识库（向量库）再提问', 400)
+                rag = get_rag_service()
+                if not rag.collection_exists(collection_name):
+                    return err(f'知识库「{collection_name}」不存在，请先上传文档或改选其它知识库', 404)
+                # 生成模型：外部优先；未选外部则把本地 Ollama 注册成 /v1 provider（同直接对话）
+                if provider is None:
+                    provider = {
+                        "base_url": OLLAMA_V1,
+                        "api_key": OLLAMA_API_KEY,
+                        "model": model,
+                    }
+                reply = chat_with_rag(message, provider, collection_name, temperature)
                 return ok({'reply': reply})
 
             if mode == 'agent':

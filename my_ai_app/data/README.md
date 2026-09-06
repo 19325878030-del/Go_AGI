@@ -7,8 +7,8 @@
 | 内容 | 说明 | 产生方式 |
 |---|---|---|
 | `tidb/` | TiDB Cloud 连接相关：TLS 证书 `isrgrootx1.pem`、初始化脚本 `setup_tidb.py` | 手动 / 脚本 |
-| `chroma_db/` | RAG 向量知识库 | `modules/rag/rag_demo.py` 首次构建 |
-| `sample.txt` | RAG 知识库源文档 | 手动维护 |
+| `chroma_db/` | RAG 命名向量知识库（前端「上传建库」生成；集合名存 `[a-zA-Z0-9_-]` 合法名，中文库名 slug 化后原名存 `display_name` 元数据） | 运行时生成 |
+| `uploads/` | 前端上传文档的临时落盘目录（按时间戳建子目录，入库完成后自动删除） | 运行时生成 |
 | `logs/api_requests.jsonl` | 接口入参/出参文件日志（联调时 tail 查看） | `services/log_service.py` 追加 |
 | `README.md` | 本说明 | — |
 
