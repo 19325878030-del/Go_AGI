@@ -1,0 +1,31 @@
+{
+  "package": "web_search",
+  "version": "2.0.0",
+  "entry_module": "implementation.py",
+  "tools": [
+    {
+      "name": "web_search",
+      "description": "生成网络搜索链接（Google/百度/必应，点击可打开该问题的搜索页）",
+      "entry_function": "web_search",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "搜索关键词"
+          },
+          "max_results": {
+            "type": "integer",
+            "description": "最大结果数",
+            "default": 3
+          }
+        },
+        "required": ["query"]
+      }
+    }
+  ],
+  "fallback_helper": {
+    "tool": "web_search",
+    "entry_function": "has_real_results"
+  }
+}

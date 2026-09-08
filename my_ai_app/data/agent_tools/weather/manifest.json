@@ -1,0 +1,50 @@
+{
+  "package": "weather",
+  "version": "1.0.0",
+  "entry_module": "implementation.py",
+  "tools": [
+    {
+      "name": "get_weather",
+      "description": "获取当前天气信息",
+      "entry_function": "get_current_weather",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "city": {
+            "type": "string",
+            "description": "城市名称"
+          },
+          "unit": {
+            "type": "string",
+            "enum": ["celsius", "fahrenheit"],
+            "description": "温度单位",
+            "default": "celsius"
+          }
+        },
+        "required": ["city"]
+      }
+    },
+    {
+      "name": "get_forecast",
+      "description": "获取天气预报",
+      "entry_function": "get_weather_forecast",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "city": {
+            "type": "string",
+            "description": "城市名称"
+          },
+          "days": {
+            "type": "integer",
+            "description": "预报天数",
+            "minimum": 1,
+            "maximum": 7,
+            "default": 3
+          }
+        },
+        "required": ["city"]
+      }
+    }
+  ]
+}

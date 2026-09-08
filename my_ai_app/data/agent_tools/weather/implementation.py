@@ -1,4 +1,6 @@
-# my_ai_app/modules/agent/tools/weather_tool.py
+# my_ai_app/data/agent_tools/weather/implementation.py
+# 天气工具包实现。元数据（工具Schema/入口函数/版本）见同目录 manifest.json，
+# 由 tool_registry 扫描、tool_loader 首次调用时按需导入，勿在其他位置直接 import。
 import random
 from datetime import datetime
 from typing import Dict, Any

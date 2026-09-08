@@ -119,6 +119,11 @@ INDEX_HTML = '''
                 word-wrap: break-word;
                 line-height: 1.5;
             }
+            .message a {
+                color: inherit;
+                text-decoration: underline;
+                word-break: break-all;
+            }
             .user {
                 background: #667eea;
                 color: white;
@@ -393,7 +398,7 @@ INDEX_HTML = '''
                     💬 直接对话
                 </label>
             </div>
-            <div class="mode-hint" id="modeHint">⚠️ Agent 模式仅支持本地 Ollama 模型；RAG 与直接对话可选本地或外部大模型（外部需登录）。</div>
+            <div class="mode-hint" id="modeHint">⚠️ 外部模型需登录后使用。</div>
             <div class="controls">
                 <label>
                     模型：<select id="modelSelect"><option value="">加载中。。。</option></select>
@@ -683,17 +688,10 @@ INDEX_HTML = '''
                 return checked ? checked.value : 'agent';
             }
 
-            // 模式与模型的边界：外部大模型可用于「直接对话」和 RAG；仅 Agent 依赖本地 Ollama 工具调用
-            const modeAgentRadio = document.getElementById('modeAgent');
-            const modeLlmRadio = document.getElementById('modeLlm');
-            const modeHintEl = document.getElementById('modeHint');
-
+            // 模式与模型的边界：三种模式（Agent/RAG/直接对话）本地与外部大模型均可用，
+            // 不再限制 —— Agent 的工具调用走提示词JSON协议，不依赖原生 function calling
             function updateModeByModel() {
-                const isExternal = (modelSelect.value || '').startsWith('ext:');
-                modeAgentRadio.disabled = isExternal;
-                modeHintEl.style.display = isExternal ? 'block' : 'none';
-                // 选了外部模型时，若还停在 Agent 上则强制切到「直接对话」；RAG 可用外部模型，保持不变
-                if (isExternal && modeAgentRadio.checked) modeLlmRadio.checked = true;
+                // 保留空函数：loadModels() 里的调用点不删，将来加新约束时在这里扩展
             }
 
             modelSelect.addEventListener('change', updateModeByModel);
@@ -788,7 +786,25 @@ INDEX_HTML = '''
             function addMessage(role, content) {
                 const div = document.createElement('div');
                 div.className = 'message ' + role;
-                div.textContent = content;
+                // 把文本里的 URL 渲染成可点击链接（新标签页打开）。
+                // 用 DOM 节点拼接而非 innerHTML：模型回复是不可信输入，防注入
+                const urlPattern = /(https?:\/\/[^\s<>"')\]]+)/g;
+                let lastIndex = 0, match;
+                while ((match = urlPattern.exec(content)) !== null) {
+                    if (match.index > lastIndex) {
+                        div.appendChild(document.createTextNode(content.slice(lastIndex, match.index)));
+                    }
+                    const a = document.createElement('a');
+                    a.href = match[0];
+                    a.target = '_blank';
+                    a.rel = 'noopener noreferrer';
+                    a.textContent = match[0];
+                    div.appendChild(a);
+                    lastIndex = match.index + match[0].length;
+                }
+                if (lastIndex < content.length) {
+                    div.appendChild(document.createTextNode(content.slice(lastIndex)));
+                }
                 chatBox.appendChild(div);
                 chatBox.scrollTop = chatBox.scrollHeight;
             }
@@ -1129,41 +1145,63 @@ def chat_with_rag(message, provider, collection_name, temperature=0.7):
 
 
 # ==================== Agent支持 ====================
-# 同样采用懒加载单例：Agent初始化只需注册工具（快），
-# 但保持与RAG一致的模式，首次调用时创建，后续复用
-_agent_instance = None
+# 懒加载单例，按「模型标识」缓存：本地模型用模型名、外部模型用 provider id。
+# 切换模型时旧单例直接换掉（Agent持有的客户端绑定模型，重建成本低——只扫manifest）。
+_agents = {}
+# 记录单例对应的本地模型名，模型变化时据此清掉本地侧缓存
+_agent_local_model = MODEL_NAME
 
 
-def get_agent():
-    """获取（必要时初始化）FunctionCallAgent单例"""
-    global _agent_instance
-    if _agent_instance is None:
-        from modules.agent.custom_agent import FunctionCallAgent
+def get_agent(provider=None, model=None):
+    """获取（必要时初始化）FunctionCallAgent单例。
 
-        _agent_instance = FunctionCallAgent(
-            model_name=_current_model,
-            ollama_url=OLLAMA_BASE
-        )
-    return _agent_instance
-
-
-def chat_with_agent(message):
+    Args:
+        provider: 外部模型配置 {base_url, api_key, model}；None = 本地 Ollama
+        model:    本地 Ollama 模型名（provider 为 None 时生效）
     """
-    使用Agent回答（支持天气/计算器/单位转换/搜索等工具调用）
+    global _agent_local_model
+    from modules.agent.custom_agent import FunctionCallAgent
+
+    if provider:
+        # 外部模型按 provider id 缓存（同模型多请求复用同一客户端/Session）
+        key = f"ext:{provider['id']}"
+    else:
+        model = model or _current_model
+        # 本地模型变化时清空本地侧旧单例（外部侧不受影响）
+        if model != _agent_local_model:
+            _agents.pop(f"local:{_agent_local_model}", None)
+            _agent_local_model = model
+        key = f"local:{model}"
+
+    if key not in _agents:
+        _agents[key] = (FunctionCallAgent(model_name=model, ollama_url=OLLAMA_BASE, provider=provider)
+                        if provider else FunctionCallAgent(model_name=model, ollama_url=OLLAMA_BASE))
+    return _agents[key]
+
+
+def chat_with_agent(message, provider=None, model=None, temperature=0.7):
+    """
+    使用Agent回答（支持天气/计算器/单位转换/搜索等工具调用）。
+    模型与"直接对话"同构：provider 传外部配置走外部大模型，否则本地 Ollama。
 
     Returns:
         (回答文本, 工具调用轨迹列表)
     """
     trace = []
     try:
-        agent = get_agent()
+        agent = get_agent(provider=provider, model=model)
         reply = agent.chat(message, trace=trace)
         return reply, trace
 
     except Exception as e:
         print(f"Agent错误: {e}")
-        # Agent失败时降级到普通LLM，保证前端始终有回复
-        return chat_with_llm(message, 0.7), trace
+        # Agent失败时降级到普通LLM，保证前端始终有回复（外部模型同样降级）
+        if provider:
+            try:
+                return llm_provider_service.chat_openai_compatible(provider, message, temperature), trace
+            except Exception as e2:
+                return f'Agent调用失败: {e2}', trace
+        return chat_with_llm(message, temperature, model), trace
 
 
 # ==================== 应用工厂 ====================
@@ -1337,13 +1375,15 @@ def _register_inline_routes(app):
     def chat():
         """聊天API
 
-        三种模式相互独立（后续要加的"并行模式"再统一编排）：
+        三种模式相互独立（后续要加的"并行模式"再统一编排），
+        模型选择对三种模式一致：本地 Ollama 或外部大模型（provider_id）皆可：
           - rag：用前端指定的向量库（collection_name）检索，生成模型 = 前端当前所选
-            （本地 Ollama 或外部大模型皆可，检索仍用本地嵌入模型）
-          - agent：只能走本地 Ollama（工具调用基于本地模型与单例）
-          - llm 直接对话：可选本地 Ollama，或外部大模型（provider_id）
+            （检索仍用本地嵌入模型）
+          - agent：工具调用为提示词约定的JSON协议，不依赖原生 function calling，
+            本地与外部大模型走同一代码路径
+          - llm 直接对话：统一 OpenAI 兼容调用
         """
-        global _agent_instance, _current_model
+        global _current_model
         try:
             data = request.json
             message = data.get('message', '')
@@ -1354,7 +1394,7 @@ def _register_inline_routes(app):
             provider_id = data.get('provider_id')
 
             # 走外部模型：先取本人配置（含完整api_key），取不到说明未登录/配置被删。
-            # 外部模型可用于「直接对话」和 RAG 生成；Agent 依赖本地 Ollama 工具调用，仍不支持。
+            # 三种模式（agent/rag/llm）均可用外部模型。
             provider = None
             if provider_id is not None:
                 uid = session.get('user_id')
@@ -1363,14 +1403,10 @@ def _register_inline_routes(app):
                 provider = llm_provider_service.get_provider_by_id(provider_id, uid)
                 if provider is None:
                     return err('外部模型配置不存在，请重新选择或添加', 400)
-                if mode == 'agent':
-                    return err('外部模型目前仅支持「直接对话」和 RAG 模式；'
-                               'Agent 请先把模型切回本地再使用', 400)
 
-            # 本地模型变化时丢弃旧 Agent 单例，下次调用会用新模型重建。
-            # RAG 生成按请求走 provider、无状态，检索只依赖固定的本地嵌入模型，无需重建。
-            if model != _current_model:
-                _agent_instance = None
+            # 本地模型变化时更新全局记录（Agent 本地侧单例在 get_agent 内按模型清理，
+            # RAG 生成按请求走 provider、无状态，均无需在此处理）
+            if provider is None and model != _current_model:
                 _current_model = model
                 print(f"🔄 切换模型:{model}")
 
@@ -1397,7 +1433,9 @@ def _register_inline_routes(app):
                 return ok({'reply': reply})
 
             if mode == 'agent':
-                reply, trace = chat_with_agent(message)
+                # 模型与直接对话同构：外部传 provider，本地传 model
+                reply, trace = chat_with_agent(message, provider=provider, model=model,
+                                               temperature=temperature)
                 return ok({'reply': reply, 'trace': trace})
 
             # 默认直接对话：本地与外部统一走 chat_openai_compatible()
