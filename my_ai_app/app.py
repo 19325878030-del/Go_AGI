@@ -35,12 +35,13 @@ load_dotenv(BASE_DIR / ".env")
 
 # ==================== 接口层 / 服务层 组件（工厂内注册） ====================
 # 登录注册蓝图 auth_bp、外部模型配置蓝图 llm_bp（自带上 /api/auth、/api/llm 前缀）
-from controllers import auth_bp, llm_bp
+from controllers import auth_bp, llm_bp, conv_bp
 from controllers.api.response import ok, err
 # TiDB 三张表初始化（users / api_logs / llm_providers）
 from services.user_service import init_db as user_init_db
 from services.log_service import init_log_db
 from services import llm_provider_service
+from services import conversation_service
 
 
 # ==================== 配置 ====================
@@ -56,417 +57,774 @@ _current_model = MODEL_NAME
 
 
 # ==================== 简单测试前端页面（前端代码已全部内联于此） ====================
-# 页面含 Vue 风格 {{ }} 语法，不能走 render_template_string，只能原样返回避免被 Jinja 解析。
+# 页面含 Vue 3 的 {{ }} 语法，不能走 Jinja 渲染，只能原样返回。
 # 原独立文件 static/chat_index.html 已合并删除：HTML + CSS + JS 都在这一个字符串里。
-INDEX_HTML = '''
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>AI 助手</title>
-        <style>
-            * {
-                margin: 0;
-                padding: 0;
-                box-sizing: border-box;
-            }
-            body {
-                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                min-height: 100vh;
-                display: flex;
-                justify-content: center;
-                align-items: center;
-            }
-            .container {
-                background: white;
-                border-radius: 20px;
-                padding: 40px;
-                width: 90%;
-                max-width: 800px;
-                max-height: 90vh;
-                box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-                display: flex;
-                flex-direction: column;
-            }
-            h1 {
-                text-align: center;
-                color: #333;
-                margin-bottom: 20px;
-                font-size: 28px;
-            }
-            .chat-box {
-                flex: 1;
-                overflow-y: auto;
-                min-height: 400px;
-                max-height: 500px;
-                border: 1px solid #e1e5e9;
-                border-radius: 10px;
-                padding: 20px;
-                margin-bottom: 20px;
-                background: #f8f9fa;
-            }
-            .message {
-                margin-bottom: 15px;
-                padding: 10px 15px;
-                border-radius: 10px;
-                max-width: 80%;
-                word-wrap: break-word;
-                line-height: 1.5;
-            }
-            .user {
-                background: #667eea;
-                color: white;
-                margin-left: auto;
-            }
-            .assistant {
-                background: white;
-                border: 1px solid #e1e5e9;
-                margin-right: auto;
-            }
-            .input-area {
-                display: flex;
-                gap: 10px;
-            }
-            textarea {
-                flex: 1;
-                padding: 12px;
-                border: 1px solid #ddd;
-                border-radius: 10px;
-                resize: vertical;
-                font-size: 14px;
-                font-family: inherit;
-                min-height: 60px;
-            }
-            textarea:focus {
-                outline: none;
-                border-color: #667eea;
-            }
-            select{
-                padding: 6px 10px;
-                border:1px solid #ddd;
-                border-radius:8px;
-                font-size:14px;
-                max-width:220px;
+INDEX_HTML = r'''
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI 助手</title>
+    <script src="https://cdn.jsdelivr.net/npm/vue@3/dist/vue.global.prod.js">
+    </script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        html, body {
+            height: 100%;
+            overflow: hidden;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        }
+
+        /* ==================== 布局 ==================== */
+        .app-layout {
+            display: flex;
+            height: 100vh;
+            background: #f0f2f5;
+        }
+
+        /* ==================== 侧边栏 ==================== */
+        .sidebar {
+            width: 280px;
+            min-width: 280px;
+            background: #fff;
+            display: flex;
+            flex-direction: column;
+            border-right: 1px solid #e1e5e9;
+        }
+        .sidebar-header {
+            padding: 16px 16px 12px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid #f0f0f0;
+        }
+        .sidebar-header h3 {
+            font-size: 16px;
+            color: #333;
+        }
+        .new-chat-btn {
+            padding: 6px 14px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: #fff;
+            border: none;
+            border-radius: 8px;
+            font-size: 13px;
+            cursor: pointer;
+            white-space: nowrap;
+            transition: opacity 0.2s;
+        }
+        .new-chat-btn:hover {
+            opacity: 0.85;
+        }
+        .new-chat-btn:disabled {
+            opacity: 0.4;
+            cursor: not-allowed;
+        }
+        .conv-list {
+            flex: 1;
+            overflow-y: auto;
+            padding: 8px 0;
+        }
+        .conv-item {
+            padding: 12px 16px;
+            cursor: pointer;
+            border-left: 3px solid transparent;
+            transition: background 0.15s;
+            position: relative;
+        }
+        .conv-item:hover {
+            background: #f5f6fa;
+        }
+        .conv-item.active {
+            background: #eef0ff;
+            border-left-color: #667eea;
+        }
+        .conv-item .conv-title {
+            font-size: 14px;
+            color: #333;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .conv-item.active .conv-title {
+            color: #667eea;
+            font-weight: 600;
+        }
+        .conv-item .conv-time {
+            font-size: 11px;
+            color: #999;
+            margin-top: 2px;
+        }
+        .conv-empty {
+            padding: 32px 16px;
+            text-align: center;
+            color: #999;
+            font-size: 14px;
+        }
+        .conv-empty-hint {
+            font-size: 12px;
+            margin-top: 6px;
+            color: #bbb;
+        }
+        .conv-loading {
+            padding: 24px;
+            text-align: center;
+            color: #999;
+            font-size: 13px;
+        }
+        .sidebar-footer {
+            padding: 12px 16px;
+            border-top: 1px solid #f0f0f0;
+            font-size: 12px;
+            color: #999;
+            text-align: center;
+        }
+
+        /* ==================== 主区域 ==================== */
+        .main-area {
+            flex: 1;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            overflow: hidden;
+            padding: 20px;
+        }
+        .container {
+            background: white;
+            border-radius: 20px;
+            padding: 30px 36px;
+            width: 100%;
+            max-width: 820px;
+            height: 100%;
+            max-height: calc(100vh - 40px);
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            display: flex;
+            flex-direction: column;
+        }
+        .container h1 {
+            text-align: center;
+            color: #333;
+            margin-bottom: 14px;
+            font-size: 24px;
+        }
+
+        /* ==================== 聊天区 ==================== */
+        .chat-box {
+            flex: 1;
+            overflow-y: auto;
+            min-height: 280px;
+            border: 1px solid #e1e5e9;
+            border-radius: 10px;
+            padding: 16px 18px;
+            margin-bottom: 12px;
+            background: #f8f9fa;
+        }
+        .message {
+            margin-bottom: 12px;
+            padding: 10px 15px;
+            border-radius: 10px;
+            max-width: 82%;
+            word-wrap: break-word;
+            line-height: 1.55;
+            font-size: 14px;
+        }
+        .user {
+            background: #667eea;
+            color: white;
+            margin-left: auto;
+        }
+        .assistant {
+            background: white;
+            border: 1px solid #e1e5e9;
+            margin-right: auto;
+        }
+        .input-area {
+            display: flex;
+            gap: 10px;
+        }
+        .input-area textarea {
+            flex: 1;
+            padding: 10px 14px;
+            border: 1px solid #ddd;
+            border-radius: 10px;
+            resize: none;
+            font-size: 14px;
+            font-family: inherit;
+            min-height: 52px;
+            max-height: 120px;
+            line-height: 1.4;
+        }
+        .input-area textarea:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        .input-area button {
+            padding: 10px 28px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 10px;
+            font-size: 15px;
+            cursor: pointer;
+            transition: opacity 0.2s;
+            white-space: nowrap;
+            align-self: flex-end;
+        }
+        .input-area button:hover:not(:disabled) {
+            opacity: 0.88;
+        }
+        .input-area button:disabled {
+            opacity: 0.55;
+            cursor: not-allowed;
+        }
+        .status {
+            text-align: center;
+            margin-top: 8px;
+            font-size: 13px;
+            color: #666;
+            min-height: 20px;
+        }
+
+        /* ==================== 模式 / 模型控制栏 ==================== */
+        .controls {
+            display: flex;
+            gap: 12px;
+            margin-bottom: 8px;
+            font-size: 13px;
+            color: #666;
+            flex-wrap: wrap;
+            align-items: center;
+        }
+        .controls label {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            cursor: pointer;
+        }
+        .controls select {
+            padding: 5px 10px;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            font-size: 13px;
+            max-width: 200px;
+            background: #fff;
+        }
+        .controls input[type="range"] {
+            width: 80px;
+            cursor: pointer;
+        }
+        .add-llm-btn {
+            padding: 3px 10px;
+            font-size: 12px;
+            border-radius: 8px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            cursor: pointer;
+            margin-left: 2px;
+        }
+        .mode-hint {
+            display: none;
+            font-size: 12px;
+            color: #e67e22;
+            margin-top: 2px;
+            margin-bottom: 6px;
+        }
+        .mode-hint.show {
+            display: block;
+        }
+        label.disabled-mode {
+            opacity: 0.45;
+            cursor: not-allowed;
+        }
+
+        /* ==================== 工具调用轨迹 ==================== */
+        .tool-trace {
+            margin-bottom: 12px;
+            padding: 10px 14px;
+            border-radius: 10px;
+            max-width: 82%;
+            margin-right: auto;
+            background: #f0f4ff;
+            border: 1px dashed #667eea;
+            font-size: 13px;
+            color: #555;
+            line-height: 1.6;
+        }
+        .tool-trace .tool-step {
+            margin: 2px 0;
+        }
+        .tool-trace .tool-name {
+            color: #667eea;
+            font-weight: bold;
+        }
+
+        /* ==================== 加载动画 ==================== */
+        .loading {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            border: 2px solid #e1e5e9;
+            border-top: 2px solid #667eea;
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+            vertical-align: middle;
+            margin-right: 4px;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        .msg-loading {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            color: #999;
+            font-size: 13px;
+            padding: 10px 15px;
+            margin-bottom: 12px;
+            max-width: 82%;
+            margin-right: auto;
+        }
+
+        /* ==================== 登录注册 ==================== */
+        .auth-bar {
+            display: flex;
+            justify-content: flex-end;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 10px;
+            font-size: 13px;
+            color: #666;
+        }
+        .auth-bar button {
+            padding: 4px 12px;
+            font-size: 12px;
+            border-radius: 8px;
+        }
+        .auth-bar .auth-login-btn {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: #fff;
+            border: none;
+            cursor: pointer;
+        }
+        .auth-bar .auth-logout-btn {
+            background: #e74c3c;
+            color: #fff;
+            border: none;
+            cursor: pointer;
+        }
+
+        /* ==================== 模态弹窗 ==================== */
+        .modal-mask {
+            display: none;
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.45);
+            justify-content: center;
+            align-items: center;
+            z-index: 100;
+        }
+        .modal-mask.show {
+            display: flex;
+        }
+        .modal {
+            background: white;
+            border-radius: 16px;
+            padding: 28px 30px;
+            width: 340px;
+            max-width: 90vw;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+        }
+        .modal h2 {
+            text-align: center;
+            color: #333;
+            font-size: 20px;
+            margin-bottom: 18px;
+        }
+        .modal input {
+            width: 100%;
+            padding: 10px 12px;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            font-size: 14px;
+            margin-bottom: 10px;
+            box-sizing: border-box;
+        }
+        .modal input:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        .modal .error {
+            color: #e74c3c;
+            font-size: 13px;
+            min-height: 18px;
+            margin-bottom: 6px;
+            text-align: center;
+        }
+        .modal .btn-row {
+            display: flex;
+            gap: 10px;
+            margin-top: 4px;
+        }
+        .modal .btn-row button {
+            flex: 1;
+            padding: 9px 0;
+            font-size: 14px;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            color: #fff;
+            transition: opacity 0.2s;
+        }
+        .modal .btn-row button:hover {
+            opacity: 0.88;
+        }
+        .modal .btn-primary {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        }
+        .modal .btn-secondary {
+            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+        }
+        .modal .btn-cancel {
+            background: #9aa0a6;
+        }
+        .modal.wide {
+            width: 420px;
+        }
+        .modal select {
+            width: 100%;
+            padding: 10px 12px;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            font-size: 14px;
+            margin-bottom: 10px;
+            box-sizing: border-box;
+            background: white;
+        }
+        .modal .hint {
+            font-size: 12px;
+            color: #999;
+            margin-bottom: 10px;
+            line-height: 1.5;
+        }
+        .modal .success {
+            color: #27ae60;
+            font-size: 13px;
+            min-height: 18px;
+            margin-bottom: 6px;
+            text-align: center;
+            word-break: break-all;
+        }
+        .provider-list .provider-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 8px 10px;
+            border: 1px solid #eee;
+            border-radius: 8px;
+            margin-bottom: 6px;
+            font-size: 13px;
+        }
+        .provider-list .provider-item .del-btn {
+            background: #e74c3c;
+            color: white;
+            border: none;
+            border-radius: 6px;
+            padding: 4px 10px;
+            font-size: 12px;
+            cursor: pointer;
+        }
+
+        /* ==================== 消息加载占位（detail加载时） ==================== */
+        .chat-loading-overlay {
+            text-align: center;
+            padding: 32px 0;
+            color: #999;
+        }
+    </style>
+</head>
+
+<body>
+<div id="app" v-cloak>
+    <div class="app-layout">
+
+        <!-- ================== 左侧边栏 ================== -->
+        <aside class="sidebar">
+            <div class="sidebar-header">
+                <h3>📋 会话历史</h3>
+                <button class="new-chat-btn" @click="newConversation" :disabled="!user">+ 新建</button>
+            </div>
+
+            <!-- 未登录提示 -->
+            <div v-if="!user" class="conv-empty">
+                <p>🔒 <a href="#" @click.prevent="showAuth()" style="color:#667eea;">登录</a> 后查看历史会话</p>
+            </div>
+
+            <!-- 加载中 -->
+            <div v-else-if="loadingConversations" class="conv-loading">
+                <span class="loading"></span> 加载中...
+            </div>
+
+            <!-- 会话列表 -->
+            <div v-else class="conv-list">
+                <div v-for="conv in conversations"
+                     :key="conv.id"
+                     :class="['conv-item', { active: currentConvId === conv.id }]"
+                     @click="loadConversation(conv.id)">
+                    <div class="conv-title">{{ conv.title }}</div>
+                    <div class="conv-time">{{ formatTime(conv.updated_at) }}</div>
+                </div>
+                <div v-if="conversations.length === 0" class="conv-empty">
+                    <p>暂无会话记录</p>
+                    <p class="conv-empty-hint">发送消息将自动创建新会话</p>
+                </div>
+            </div>
+
+            <div class="sidebar-footer">Go_AGI</div>
+        </aside>
+
+        <!-- ================== 主聊天区 ================== -->
+        <main class="main-area">
+            <div class="container">
+                <h1>🤖 AI 助手</h1>
+
+                <!-- 登录注册状态条 -->
+                <div class="auth-bar">
+                    <span>👤 {{ user ? user.username : '未登录' }}</span>
+                    <button v-if="!user" class="auth-login-btn" @click="showAuth()">登录 / 注册</button>
+                    <button v-else class="auth-logout-btn" @click="doLogout()">退出登录</button>
+                </div>
+
+                <!-- 模式选择 -->
+                <div class="controls">
+                    <label :class="{ 'disabled-mode': isExternal }">
+                        <input type="radio" value="agent" v-model="mode" :disabled="isExternal">
+                        🤖 Agent模式
+                    </label>
+                    <label :class="{ 'disabled-mode': isExternal }">
+                        <input type="radio" value="rag" v-model="mode" :disabled="isExternal">
+                        📚 RAG模式
+                    </label>
+                    <label>
+                        <input type="radio" value="llm" v-model="mode">
+                        💬 直接对话
+                    </label>
+                </div>
+                <div :class="['mode-hint', { show: isExternal }]">
+                    ⚠️ 外部大模型目前仅支持「直接对话」，Agent / RAG 使用本地 Ollama 模型。
+                </div>
+
+                <!-- 模型选择 & 温度 -->
+                <div class="controls">
+                    <label>
+                        模型：
+                        <select v-model="modelSelect" @change="onModelChange">
+                            <optgroup label="本地 Ollama">
+                                <option v-for="m in localModels" :key="m" :value="m">{{ m }}</option>
+                            </optgroup>
+                            <optgroup label="外部大模型">
+                                <option v-for="p in externalProviders" :key="p.id" :value="'ext:' + p.id">
+                                    {{ p.name && p.name !== p.model ? p.name + '（' + p.model + '）' : p.model }}
+                                </option>
+                                <option v-if="externalProviders.length === 0" value="" disabled>
+                                    未添加（点右侧 ➕）
+                                </option>
+                            </optgroup>
+                        </select>
+                        <button type="button" class="add-llm-btn" @click="showLlmConfig()">➕ 外部模型</button>
+                    </label>
+                    <label>
+                        温度：
+                        <input type="range" v-model.number="temperature" min="0" max="2" step="0.1">
+                        <span>{{ temperature.toFixed(1) }}</span>
+                    </label>
+                </div>
+
+                <!-- 当前会话标题 -->
+                <div v-if="currentConvTitle && messages.length > 1" style="margin-bottom:4px;font-size:13px;color:#999;text-align:center;">
+                    📌 {{ currentConvTitle }}
+                </div>
+
+                <!-- 消息容器 -->
+                <div class="chat-box" ref="chatBox">
+                    <!-- 加载消息中的占位 -->
+                    <div v-if="loadingMessages" class="chat-loading-overlay">
+                        <span class="loading"></span> 加载历史消息...
+                    </div>
+
+                    <!-- 消息列表 -->
+                    <template v-else>
+                        <div v-for="(msg, idx) in messages" :key="idx">
+                            <div v-if="msg.type === 'trace'" class="tool-trace">
+                                <div v-for="(step, si) in msg.steps" :key="si" class="tool-step">
+                                    <span class="tool-name">🔧 {{ step.tool }}</span>
+                                    ({{ JSON.stringify(step.parameters) }} → {{ JSON.stringify(step.result).slice(0, 120) }})
+                                </div>
+                            </div>
+                            <div v-else :class="['message', msg.role]">
+                                {{ msg.content }}
+                            </div>
+                        </div>
+
+                        <!-- 思考中 -->
+                        <div v-if="isProcessing" class="msg-loading">
+                            <span class="loading"></span> 思考中...
+                        </div>
+
+                        <!-- 初始提示 -->
+                        <div v-if="messages.length === 0 && !isProcessing && !loadingMessages"
+                             class="message assistant">
+                            你好！我是AI助手，有什么可以帮你的吗？
+                        </div>
+                    </template>
+                </div>
+
+                <!-- 输入区 -->
+                <div class="input-area">
+                    <textarea v-model="userInput"
+                              placeholder="输入你的问题..."
+                              rows="2"
+                              @keydown.enter.prevent="sendMessage"
+                              :disabled="isProcessing"></textarea>
+                    <button @click="sendMessage" :disabled="isProcessing || !userInput.trim()">
+                        发送
+                    </button>
+                </div>
+                <div class="status" v-html="status"></div>
+            </div>
+        </main>
+    </div>
+
+    <!-- ================== 登录/注册弹窗 ================== -->
+    <div :class="['modal-mask', { show: showAuthModal }]" @click.self="hideAuth()">
+        <div class="modal">
+            <h2>账号登录 / 注册</h2>
+            <input type="text" v-model="authUsername" placeholder="用户名（至少2个字符）" autocomplete="username" @keydown.enter="doLogin">
+            <input type="password" v-model="authPassword" placeholder="密码（至少6位）" autocomplete="current-password" @keydown.enter="doLogin">
+            <div class="error">{{ authError }}</div>
+            <div class="btn-row">
+                <button class="btn-primary" @click="doLogin">登录</button>
+                <button class="btn-secondary" @click="doRegister">注册</button>
+                <button class="btn-cancel" @click="hideAuth">取消</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ================== 外部大模型弹窗 ================== -->
+    <div :class="['modal-mask', { show: showLlmModal }]" @click.self="hideLlmConfig()">
+        <div class="modal wide">
+            <h2>🔗 外部大模型</h2>
+            <div class="hint">手动填写连接信息（OpenAI兼容接口）。配置保存在你的账号下。</div>
+            <input type="text" v-model="llmBaseUrl" placeholder="API地址，如 https://api.deepseek.com">
+            <input type="text" v-model="llmModelName" placeholder="模型名称，如 deepseek-chat">
+            <input type="password" v-model="llmApiKey" placeholder="API Key（sk-开头，只存你的账号）" autocomplete="off">
+            <div class="error">{{ llmError }}</div>
+            <div class="success">{{ llmSuccess }}</div>
+            <div class="btn-row">
+                <button class="btn-cancel" @click="testLlmProvider()">测试连接</button>
+                <button class="btn-primary" @click="saveLlmProvider()">保存</button>
+            </div>
+            <h2 style="font-size:15px; margin-top:18px;">已保存的配置</h2>
+            <div class="provider-list" id="providerList">
+                <div v-for="p in providerList" :key="p.id" class="provider-item">
+                    <div>
+                        <strong>{{ p.name || p.model }}</strong><br>
+                        <span style="color:#999">{{ p.model }} · {{ p.api_key }}</span>
+                    </div>
+                    <button class="del-btn" @click="deleteLlmProvider(p.id)">删除</button>
+                </div>
+                <div v-if="providerList.length === 0" class="hint" style="margin-top:8px;">还没有保存的配置</div>
+            </div>
+            <div class="btn-row" style="margin-top:10px;">
+                <button class="btn-cancel" @click="hideLlmConfig()">关闭</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+    const { createApp, ref, computed, nextTick, onMounted } = Vue;
+
+    const app = createApp({
+        setup() {
+            // ==================== 响应式状态 ====================
+            const conversations = ref([]);
+            const currentConvId = ref(null);
+            const currentConvTitle = ref('');
+            const messages = ref([]);
+            const userInput = ref('');
+            const isProcessing = ref(false);
+            const loadingConversations = ref(false);
+            const loadingMessages = ref(false);
+
+            const localModels = ref([]);
+            const externalProviders = ref([]);
+            const modelSelect = ref('');
+            const temperature = ref(0.7);
+            const mode = ref('agent');
+            const status = ref('✅ 服务运行中');
+
+            const user = ref(null);
+
+            // Auth modal
+            const showAuthModal = ref(false);
+            const authUsername = ref('');
+            const authPassword = ref('');
+            const authError = ref('');
+
+            // LLM modal
+            const showLlmModal = ref(false);
+            const llmBaseUrl = ref('');
+            const llmModelName = ref('');
+            const llmApiKey = ref('');
+            const llmError = ref('');
+            const llmSuccess = ref('');
+            const providerList = ref([]);
+
+            const chatBox = ref(null);
+
+            // ==================== 计算属性 ====================
+            const isExternal = computed(() => {
+                return modelSelect.value && String(modelSelect.value).startsWith('ext:');
+            });
+
+            // ==================== 工具函数 ====================
+            function formatTime(dt) {
+                if (!dt) return '';
+                const d = new Date(dt);
+                if (isNaN(d.getTime())) return dt;
+                const now = new Date();
+                const pad = (n) => String(n).padStart(2, '0');
+                // 今天的只显示 时:分
+                if (d.toDateString() === now.toDateString()) {
+                    return pad(d.getHours()) + ':' + pad(d.getMinutes());
                 }
-            button {
-                padding: 12px 30px;
-                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                color: white;
-                border: none;
-                border-radius: 10px;
-                font-size: 16px;
-                cursor: pointer;
-                transition: transform 0.2s;
-                white-space: nowrap;
-            }
-            button:hover {
-                transform: scale(1.05);
-            }
-            button:disabled {
-                opacity: 0.6;
-                cursor: not-allowed;
-            }
-            .status {
-                text-align: center;
-                margin-top: 10px;
-                font-size: 14px;
-                color: #666;
-            }
-            .controls {
-                display: flex;
-                gap: 15px;
-                margin-bottom: 10px;
-                font-size: 14px;
-                color: #666;
-            }
-            .controls label {
-                display: flex;
-                align-items: center;
-                gap: 5px;
-                cursor: pointer;
-            }
-            .tool-trace {
-                margin-bottom: 15px;
-                padding: 10px 15px;
-                border-radius: 10px;
-                max-width: 80%;
-                margin-right: auto;
-                background: #f0f4ff;
-                border: 1px dashed #667eea;
-                font-size: 13px;
-                color: #555;
-                line-height: 1.6;
-            }
-            .tool-trace .tool-step {
-                margin: 2px 0;
-            }
-            .tool-trace .tool-name {
-                color: #667eea;
-                font-weight: bold;
-            }
-            .loading {
-                display: inline-block;
-                width: 12px;
-                height: 12px;
-                border: 2px solid #f3f3f3;
-                border-top: 2px solid #667eea;
-                border-radius: 50%;
-                animation: spin 1s linear infinite;
-            }
-            @keyframes spin {
-                0% { transform: rotate(0deg); }
-                100% { transform: rotate(360deg); }
+                // 昨天的显示 "昨天 时:分"
+                const yesterday = new Date(now);
+                yesterday.setDate(yesterday.getDate() - 1);
+                if (d.toDateString() === yesterday.toDateString()) {
+                    return '昨天 ' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+                }
+                // 今年内的显示 月-日
+                if (d.getFullYear() === now.getFullYear()) {
+                    return (d.getMonth() + 1) + '-' + d.getDate();
+                }
+                return d.getFullYear() + '-' + (d.getMonth() + 1) + '-' + d.getDate();
             }
 
-            /* ==================== 登录注册 ==================== */
-            .auth-bar {
-                display: flex;
-                justify-content: flex-end;
-                align-items: center;
-                gap: 10px;
-                margin-bottom: 15px;
-                font-size: 14px;
-                color: #666;
-            }
-            .auth-bar button {
-                padding: 6px 14px;
-                font-size: 13px;
-                border-radius: 8px;
-            }
-            .modal-mask {
-                display: none;
-                position: fixed;
-                inset: 0;
-                background: rgba(0, 0, 0, 0.45);
-                justify-content: center;
-                align-items: center;
-                z-index: 100;
-            }
-            .modal-mask.show {
-                display: flex;
-            }
-            .modal {
-                background: white;
-                border-radius: 16px;
-                padding: 30px;
-                width: 340px;
-                max-width: 90vw;
-                box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
-            }
-            .modal h2 {
-                text-align: center;
-                color: #333;
-                font-size: 22px;
-                margin-bottom: 20px;
-            }
-            .modal input {
-                width: 100%;
-                padding: 10px 12px;
-                border: 1px solid #ddd;
-                border-radius: 8px;
-                font-size: 14px;
-                margin-bottom: 12px;
-                box-sizing: border-box;
-            }
-            .modal input:focus {
-                outline: none;
-                border-color: #667eea;
-            }
-            .modal .error {
-                color: #e74c3c;
-                font-size: 13px;
-                min-height: 18px;
-                margin-bottom: 8px;
-                text-align: center;
-            }
-            .modal .btn-row {
-                display: flex;
-                gap: 10px;
-            }
-            .modal .btn-row button {
-                flex: 1;
-                padding: 10px;
-                font-size: 14px;
-            }
-            .modal .btn-row .btn-secondary {
-                background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
-            }
-            .modal .btn-row .btn-cancel {
-                background: #9aa0a6;
-            }
-            /* 外部模型管理弹窗：比登录弹窗宽一点，容纳更多输入框 */
-            .modal.wide {
-                width: 420px;
-            }
-            .modal select {
-                width: 100%;
-                padding: 10px 12px;
-                border: 1px solid #ddd;
-                border-radius: 8px;
-                font-size: 14px;
-                margin-bottom: 12px;
-                box-sizing: border-box;
-                background: white;
-            }
-            .modal .hint {
-                font-size: 12px;
-                color: #999;
-                margin-bottom: 12px;
-                line-height: 1.5;
-            }
-            .modal .success {
-                color: #27ae60;
-                font-size: 13px;
-                min-height: 18px;
-                margin-bottom: 8px;
-                text-align: center;
-                word-break: break-all;
-            }
-            .provider-list .provider-item {
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-                padding: 8px 10px;
-                border: 1px solid #eee;
-                border-radius: 8px;
-                margin-bottom: 8px;
-                font-size: 13px;
-            }
-            .provider-list .provider-item .del-btn {
-                background: #e74c3c;
-                color: white;
-                border: none;
-                border-radius: 6px;
-                padding: 4px 10px;
-                font-size: 12px;
-                cursor: pointer;
-            }
-            .add-llm-btn {
-                padding: 4px 10px;
-                font-size: 12px;
-                border-radius: 8px;
-                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                color: white;
-                border: none;
-                cursor: pointer;
-                margin-left: 6px;
-            }
-            .mode-hint {
-                display: none;
-                font-size: 12px;
-                color: #e67e22;
-                margin-top: 4px;
-            }
-            label.disabled-mode {
-                opacity: 0.45;
-                cursor: not-allowed;
-            }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1>🤖 AI 助手</h1>
-
-            <!-- 登录注册：状态栏，登录后显示用户名 -->
-            <div class="auth-bar">
-                <span id="authStatus">👤 未登录</span>
-                <button id="authToggleBtn" onclick="showAuthModal()">登录 / 注册</button>
-            </div>
-
-            <div class="controls">
-                <label>
-                    <input type="radio" name="mode" id="modeAgent" value="agent" checked>
-                    🤖 Agent模式（工具调用）
-                </label>
-                <label>
-                    <input type="radio" name="mode" id="modeRag" value="rag">
-                    📚 RAG模式（知识库）
-                </label>
-                <label>
-                    <input type="radio" name="mode" id="modeLlm" value="llm">
-                    💬 直接对话
-                </label>
-            </div>
-            <div class="mode-hint" id="modeHint">⚠️ 外部大模型目前仅支持「直接对话」，Agent / RAG 使用本地 Ollama 模型。</div>
-            <div class="controls">
-                <label>
-                    模型：<select id="modelSelect"><option value="">加载中。。。</option></select>
-                    <button type="button" class="add-llm-btn" onclick="showLlmModal()">➕ 外部模型</button>
-                </label>
-                <label>
-                    温度: <input type="range" id="temperature" min="0" max="2" step="0.1" value="0.7" style="width:100px">
-                    <span id="tempDisplay">0.7</span>
-                </label>
-            </div>
-
-            <div class="chat-box" id="chatBox">
-                <div class="message assistant">你好！我是AI助手，有什么可以帮你的吗？</div>
-            </div>
-
-            <div class="input-area">
-                <textarea id="userInput" placeholder="输入你的问题..." rows="2"></textarea>
-                <button id="sendBtn" onclick="sendMessage()">发送</button>
-            </div>
-            <div class="status" id="status">✅ 服务运行中</div>
-        </div>
-
-        <!-- 登录/注册弹窗（放在script之前，保证脚本执行时能取到DOM） -->
-        <div class="modal-mask" id="authModal">
-            <div class="modal">
-                <h2>账号登录 / 注册</h2>
-                <input type="text" id="authUsername" placeholder="用户名（至少2个字符）" autocomplete="username">
-                <input type="password" id="authPassword" placeholder="密码（至少6位）" autocomplete="current-password">
-                <div class="error" id="authError"></div>
-                <div class="btn-row">
-                    <button onclick="doLogin()">登录</button>
-                    <button class="btn-secondary" onclick="doRegister()">注册</button>
-                    <button class="btn-cancel" onclick="hideAuthModal()">取消</button>
-                </div>
-            </div>
-        </div>
-
-        <!-- 外部大模型配置弹窗（需登录，配置存TiDB当前用户名下） -->
-        <div class="modal-mask" id="llmModal">
-            <div class="modal wide">
-                <h2>🔗 外部大模型</h2>
-                <div class="hint">手动填写连接信息（OpenAI兼容接口）。配置保存在你的账号下（TiDB）。</div>
-                <input type="text" id="llmBaseUrl" placeholder="API地址，如 https://api.deepseek.com">
-                <input type="text" id="llmModel" placeholder="模型名称，如 deepseek-chat">
-                <input type="password" id="llmApiKey" placeholder="API Key（sk-开头，只存你的账号）" autocomplete="off">
-                <div class="error" id="llmError"></div>
-                <div class="success" id="llmSuccess"></div>
-                <div class="btn-row">
-                    <button class="btn-cancel" onclick="testLlmProvider()">测试连接</button>
-                    <button onclick="saveLlmProvider()">保存</button>
-                </div>
-                <h2 style="font-size:16px; margin-top:20px;">已保存的配置</h2>
-                <div class="provider-list" id="providerList"></div>
-                <div class="btn-row" style="margin-top:10px;">
-                    <button class="btn-cancel" onclick="hideLlmModal()">关闭</button>
-                </div>
-            </div>
-        </div>
-
-        <script>
-            const chatBox = document.getElementById('chatBox');
-            const userInput = document.getElementById('userInput');
-            const sendBtn = document.getElementById('sendBtn');
-            const temperature = document.getElementById('temperature');
-            const tempDisplay = document.getElementById('tempDisplay');
-            const status = document.getElementById('status');
-            const modelSelect = document.getElementById('modelSelect');
-
-            // 统一响应信封：所有数据接口返回 {code,msg,data}；code===0 成功，否则 data=null、msg=错误文本。
-            // HTTP 状态码保留（401 触发登录弹窗）。unwrap 把响应解包成 {code,msg,data} 便于取用。
             async function unwrap(resp) {
                 let body = null;
-                try { body = await resp.json(); } catch (e) { /* 非 JSON 响应，如 HTML 404 */ }
+                try { body = await resp.json(); } catch (e) {}
                 if (body && typeof body === 'object' && !Array.isArray(body) && 'code' in body) {
                     return { code: body.code, msg: body.msg, data: body.data };
                 }
-                // 兜底：理论不会命中（本应用数据接口均已信封化）
                 return {
                     code: resp.ok ? 0 : resp.status,
                     msg: (body && (body.msg || body.error || body.message)) || (resp.ok ? '' : '请求失败（HTTP ' + resp.status + '）'),
@@ -474,235 +832,238 @@ INDEX_HTML = '''
                 };
             }
 
-            //页面加载时获取模型列表（本地Ollama + 已登录用户的外部模型配置）
-            async function loadModels(){
-                try{
-                    const response = await fetch('/api/models');
-                    const r = await unwrap(response);
-                    const data = r.data || {};
-                    renderModelSelect(data.models || [], data.providers || []);
-                    // 恢复/改变选择后同步一次模式可选项
-                    updateModeByModel();
-                    const localCount = (data.models || []).length;
-                    const extCount = (data.providers || []).length;
-                    if (localCount === 0 && extCount === 0) {
-                        status.textContent = '⚠️ 本地Ollama未启动，也暂无外部模型（点"➕ 外部模型"添加）';
-                    } else {
-                        status.textContent = '✅ 服务运行中：本地 ' + localCount + ' 个 / 外部 ' + extCount + ' 个模型';
+            function scrollToBottom() {
+                nextTick(() => {
+                    if (chatBox.value) {
+                        chatBox.value.scrollTop = chatBox.value.scrollHeight;
                     }
+                });
+            }
+
+            // ==================== 模型相关 ====================
+            async function loadModels() {
+                try {
+                    const resp = await fetch('/api/models');
+                    const r = await unwrap(resp);
+                    const data = r.data || {};
+                    const models = data.models || [];
+                    const providers = data.providers || [];
+
+                    localModels.value = models;
+                    externalProviders.value = providers;
+
+                    // 恢复之前的选择
+                    const hasCurrent = modelSelect.value && (
+                        models.includes(modelSelect.value) ||
+                        providers.some(p => 'ext:' + p.id === modelSelect.value)
+                    );
+                    if (!hasCurrent && models.length > 0) {
+                        modelSelect.value = models[0];
+                    }
+
+                    const info = [];
+                    if (models.length > 0) info.push('本地 ' + models.length + ' 个');
+                    if (providers.length > 0) info.push('外部 ' + providers.length + ' 个');
+                    status.value = info.length > 0
+                        ? '✅ 服务运行中：' + info.join(' / ')
+                        : '⚠️ 本地Ollama未启动，也暂无外部模型（点"➕ 外部模型"添加）';
                 } catch (e) {
-                    status.textContent = '⚠️ 获取模型列表失败: ' + e.message;
+                    status.value = '⚠️ 获取模型列表失败: ' + e.message;
                 }
             }
 
-            // 渲染模型下拉框：本地一组、外部一组（外部value用 ext:{id} 标识）
-            function renderModelSelect(localModels, providers){
-                // 记住当前选择，重渲染后尽量恢复
-                const prev = modelSelect.value;
-                modelSelect.innerHTML = '';
-
-                const localGroup = document.createElement('optgroup');
-                localGroup.label = '本地 Ollama';
-                localModels.forEach(name =>{
-                    const option =document.createElement('option');
-                    option.value =name;
-                    option.textContent = name;
-                    localGroup.appendChild(option);
-                });
-                modelSelect.appendChild(localGroup);
-
-                const extGroup = document.createElement('optgroup');
-                extGroup.label = '外部大模型';
-                providers.forEach(p =>{
-                    const option = document.createElement('option');
-                    option.value = 'ext:' + p.id;
-                    // 名称与模型名相同（未单独命名）时只显示模型名，避免重复
-                    option.textContent = (p.name && p.name !== p.model)
-                        ? p.name + '（' + p.model + '）'
-                        : p.model;
-                    extGroup.appendChild(option);
-                });
-                if (providers.length === 0) {
-                    const option = document.createElement('option');
-                    option.value = '';
-                    option.textContent = '未添加（点右侧➕）';
-                    option.disabled = true;
-                    extGroup.appendChild(option);
-                }
-                modelSelect.appendChild(extGroup);
-
-                // 恢复之前的选择（选项还在时）
-                if (prev && modelSelect.querySelector('option[value="' + prev + '"]')) {
-                    modelSelect.value = prev;
+            function onModelChange() {
+                const ext = isExternal.value;
+                if (ext && mode.value !== 'llm') {
+                    mode.value = 'llm';
                 }
             }
 
-            // 登录状态变化后刷新（外部模型配置跟登录用户绑定）
-            function refreshModelsAfterAuth(){
-                loadModels();
-            }
-            loadModels();
-
-            function getMode() {
-                const checked = document.querySelector('input[name="mode"]:checked');
-                return checked ? checked.value : 'agent';
-            }
-
-            // 模式与模型的边界：外部大模型只接「直接对话」，Agent/RAG 仅用本地模型
-            const modeAgentRadio = document.getElementById('modeAgent');
-            const modeRagRadio = document.getElementById('modeRag');
-            const modeLlmRadio = document.getElementById('modeLlm');
-            const modeHintEl = document.getElementById('modeHint');
-
-            function updateModeByModel() {
-                const isExternal = (modelSelect.value || '').startsWith('ext:');
-                modeAgentRadio.disabled = isExternal;
-                modeRagRadio.disabled = isExternal;
-                modeHintEl.style.display = isExternal ? 'block' : 'none';
-                // 选了外部模型时强制切到「直接对话」
-                if (isExternal && !modeLlmRadio.checked) modeLlmRadio.checked = true;
-            }
-
-            modelSelect.addEventListener('change', updateModeByModel);
-
-            let isProcessing = false;
-
-            // 温度显示
-            temperature.addEventListener('input', () => {
-                tempDisplay.textContent = temperature.value;
-            });
-
-            // 回车发送
-            userInput.addEventListener('keydown', (e) => {
-                if (e.key === 'Enter' && !e.shiftKey) {
-                    e.preventDefault();
-                    sendMessage();
+            // ==================== 会话（Conversation）相关 ====================
+            async function loadConversations() {
+                if (!user.value) {
+                    conversations.value = [];
+                    return;
                 }
-            });
+                loadingConversations.value = true;
+                try {
+                    const resp = await fetch('/api/conversation/list');
+                    if (resp.status === 401) {
+                        user.value = null;
+                        conversations.value = [];
+                        return;
+                    }
+                    const r = await unwrap(resp);
+                    conversations.value = (r.data && r.data.conversations) || [];
+                } catch (e) {
+                    console.error('加载会话列表失败:', e);
+                } finally {
+                    loadingConversations.value = false;
+                }
+            }
 
-            async function sendMessage() {
-                if (isProcessing) return;
+            async function loadConversation(id) {
+                if (!user.value) return;
+                if (id === currentConvId.value) return;
 
-                const message = userInput.value.trim();
-                if (!message) return;
-
-                // 显示用户消息
-                addMessage('user', message);
-                userInput.value = '';
-
-                // 显示加载状态
-                isProcessing = true;
-                sendBtn.disabled = true;
-                status.innerHTML = '<span class="loading"></span> 思考中...';
+                loadingMessages.value = true;
+                currentConvId.value = id;
+                messages.value = [];
 
                 try {
-                    // 选中 ext:<id> 时走外部模型（带provider_id），否则走本地Ollama（带model）
+                    const resp = await fetch('/api/conversation/detail?id=' + id);
+                    if (resp.status === 401) { user.value = null; return; }
+                    const r = await unwrap(resp);
+                    if (r.code !== 0) {
+                        status.value = '❌ ' + (r.msg || '加载失败');
+                        return;
+                    }
+                    const data = r.data || {};
+                    currentConvTitle.value = data.title || '';
+                    const msgs = (data.messages || []).map(m => ({
+                        role: m.role,
+                        content: m.content,
+                        type: 'message',
+                    }));
+                    messages.value = msgs;
+                    status.value = '✅ 已加载历史会话';
+                } catch (e) {
+                    status.value = '❌ 加载失败: ' + e.message;
+                } finally {
+                    loadingMessages.value = false;
+                    scrollToBottom();
+                }
+            }
+
+            async function newConversation() {
+                if (!user.value) {
+                    showAuth();
+                    return;
+                }
+                try {
+                    const resp = await fetch('/api/conversation/create', { method: 'POST' });
+                    const r = await unwrap(resp);
+                    if (r.code === 0 && r.data && r.data.conversation) {
+                        const conv = r.data.conversation;
+                        // 插到列表最前面
+                        conversations.value.unshift(conv);
+                        currentConvId.value = conv.id;
+                        currentConvTitle.value = '';
+                        messages.value = [];
+                        status.value = '💬 新会话';
+                    }
+                } catch (e) {
+                    status.value = '❌ 创建会话失败: ' + e.message;
+                }
+            }
+
+            // ==================== 发送消息 ====================
+            async function sendMessage() {
+                const msg = userInput.value.trim();
+                if (!msg || isProcessing.value) return;
+
+                // 未选择模型时提示
+                if (!modelSelect.value) {
+                    status.value = '⚠️ 请先选择一个模型';
+                    return;
+                }
+
+                // 显式添加用户消息
+                messages.value.push({ role: 'user', content: msg, type: 'message' });
+                userInput.value = '';
+                isProcessing.value = true;
+                status.value = '<span class="loading"></span> 思考中...';
+                scrollToBottom();
+
+                try {
                     const sel = modelSelect.value;
-                    const isExternal = sel.startsWith('ext:');
-                    const response = await fetch('/api/chat', {
+                    const ext = sel.startsWith('ext:');
+                    const body = {
+                        message: msg,
+                        mode: mode.value,
+                        temperature: parseFloat(temperature.value),
+                        model: ext ? null : sel,
+                        provider_id: ext ? parseInt(sel.slice(4), 10) : null,
+                        conversation_id: currentConvId.value || null,
+                    };
+
+                    const resp = await fetch('/api/chat', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            message: message,
-                            mode: getMode(),
-                            temperature: parseFloat(temperature.value),
-                            model: isExternal ? null : sel,
-                            provider_id: isExternal ? parseInt(sel.slice(4), 10) : null
-                        })
+                        credentials: 'include',
+                        body: JSON.stringify(body),
                     });
 
-                    // 后端启用登录保护后，未登录会返回401
-                    if (response.status === 401) {
-                        addMessage('assistant', '🔒 请先登录后再对话');
-                        showAuthModal();
+                    if (resp.status === 401) {
+                        messages.value.push({ role: 'assistant', content: '🔒 请先登录后再对话', type: 'message' });
+                        showAuth();
                         return;
                     }
 
-                    const r = await unwrap(response);
-
+                    const r = await unwrap(resp);
                     if (r.code !== 0) {
-                        addMessage('assistant', '❌ ' + (r.msg || '请求失败'));
+                        messages.value.push({ role: 'assistant', content: '❌ ' + (r.msg || '请求失败'), type: 'message' });
                     } else {
                         const data = r.data || {};
-                        // Agent模式下先展示工具调用轨迹，再展示最终回答
-                        if (data.trace && data.trace.length > 0) {
-                            addToolTrace(data.trace);
-                        }
-                        addMessage('assistant', data.reply);
-                    }
 
-                    status.textContent = '✅ 回复完成';
-                } catch (error) {
-                    addMessage('assistant', '❌ 网络错误: ' + error.message);
-                    status.textContent = '❌ 连接失败';
+                        // 更新会话 ID（自动创建时返回）
+                        if (data.conversation_id) {
+                            currentConvId.value = data.conversation_id;
+                        }
+
+                        // 工具调用轨迹
+                        if (data.trace && data.trace.length > 0) {
+                            messages.value.push({ type: 'trace', steps: data.trace });
+                        }
+
+                        // AI 回复
+                        messages.value.push({ role: 'assistant', content: data.reply, type: 'message' });
+                        status.value = '✅ 回复完成';
+                    }
+                } catch (e) {
+                    messages.value.push({ role: 'assistant', content: '❌ 网络错误: ' + e.message, type: 'message' });
+                    status.value = '❌ 连接失败';
                 } finally {
-                    isProcessing = false;
-                    sendBtn.disabled = false;
-                    userInput.focus();
+                    isProcessing.value = false;
+                    scrollToBottom();
+                    // 有 conversation_id 的话刷新列表（标题可能已更新）
+                    if (currentConvId.value && user.value) {
+                        refreshConvItem(currentConvId.value);
+                    }
                 }
             }
 
-            function addMessage(role, content) {
-                const div = document.createElement('div');
-                div.className = 'message ' + role;
-                div.textContent = content;
-                chatBox.appendChild(div);
-                chatBox.scrollTop = chatBox.scrollHeight;
+            // 刷新单条会话标题
+            async function refreshConvItem(id) {
+                try {
+                    const resp = await fetch('/api/conversation/detail?id=' + id);
+                    const r = await unwrap(resp);
+                    if (r.code === 0 && r.data) {
+                        const idx = conversations.value.findIndex(c => c.id === id);
+                        if (idx !== -1) {
+                            // 更新标题和时间
+                            conversations.value[idx].title = r.data.title;
+                            conversations.value[idx].updated_at = r.data.updated_at;
+                            // 更新当前标题
+                            if (id === currentConvId.value) {
+                                currentConvTitle.value = r.data.title || '';
+                            }
+                        }
+                    }
+                } catch (e) {}
             }
 
-            function addToolTrace(trace) {
-                const div = document.createElement('div');
-                div.className = 'tool-trace';
-                trace.forEach(step => {
-                    const p = document.createElement('div');
-                    p.className = 'tool-step';
-                    const name = document.createElement('span');
-                    name.className = 'tool-name';
-                    name.textContent = '🔧 ' + step.tool;
-                    p.appendChild(name);
-                    p.appendChild(document.createTextNode(
-                        ' (' + JSON.stringify(step.parameters) + ') → ' +
-                        JSON.stringify(step.result).slice(0, 120)
-                    ));
-                    div.appendChild(p);
-                });
-                chatBox.appendChild(div);
-                chatBox.scrollTop = chatBox.scrollHeight;
+            // ==================== 认证相关 ====================
+            function showAuth() {
+                authError.value = '';
+                authUsername.value = '';
+                authPassword.value = '';
+                showAuthModal.value = true;
             }
 
-            // ==================== 登录注册 ====================
-            // 依赖后端 controllers/auth_controller.py 的四个接口：
-            //   POST /api/auth/register  {username, password}
-            //   POST /api/auth/login     {username, password}
-            //   POST /api/auth/logout
-            //   GET  /api/auth/me        → {"user": {"id","username"} | null}
-            // 后端未实现时这里会静默降级为"未登录"，不影响聊天功能
-            const authModal = document.getElementById('authModal');
-            const authUsername = document.getElementById('authUsername');
-            const authPassword = document.getElementById('authPassword');
-            const authError = document.getElementById('authError');
-            const authStatusEl = document.getElementById('authStatus');
-            const authToggleBtn = document.getElementById('authToggleBtn');
-
-            function showAuthModal() {
-                authError.textContent = '';
-                authModal.classList.add('show');
-                authUsername.focus();
+            function hideAuth() {
+                showAuthModal.value = false;
             }
-
-            function hideAuthModal() {
-                authModal.classList.remove('show');
-            }
-
-            // 点击遮罩空白处关闭弹窗
-            authModal.addEventListener('click', function (e) {
-                if (e.target === authModal) hideAuthModal();
-            });
-
-            // 密码框内按回车 = 登录
-            authPassword.addEventListener('keydown', function (e) {
-                if (e.key === 'Enter') doLogin();
-            });
 
             async function doLogin() {
                 await submitAuth('/api/auth/login', '登录');
@@ -712,222 +1073,205 @@ INDEX_HTML = '''
                 await submitAuth('/api/auth/register', '注册');
             }
 
-            async function submitAuth(url, actionName) {
+            async function submitAuth(url, action) {
                 const username = authUsername.value.trim();
                 const password = authPassword.value;
                 if (!username || !password) {
-                    authError.textContent = '请输入用户名和密码';
+                    authError.value = '请输入用户名和密码';
                     return;
                 }
                 try {
-                    authError.textContent = '';
-                    const response = await fetch(url, {
+                    authError.value = '';
+                    const resp = await fetch(url, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ username: username, password: password })
+                        body: JSON.stringify({ username, password }),
                     });
-                    const r = await unwrap(response);
+                    const r = await unwrap(resp);
                     if (r.code !== 0) {
-                        authError.textContent = r.msg || (actionName + '失败');
+                        authError.value = r.msg || (action + '失败');
                         return;
                     }
                     authPassword.value = '';
-                    hideAuthModal();
-                    refreshAuthStatus();
+                    hideAuth();
+                    await refreshAuthStatus();
                 } catch (e) {
-                    // 接口返回非JSON（如404页面）会走到这里，多半是后端还没实现
-                    authError.textContent = '请求失败（后端接口未实现?）: ' + e.message;
+                    authError.value = '请求失败: ' + e.message;
                 }
             }
 
             async function doLogout() {
                 try {
                     await fetch('/api/auth/logout', { method: 'POST' });
-                } catch (e) { /* 忽略网络错误 */ }
-                refreshAuthStatus();
+                } catch (e) {}
+                user.value = null;
+                conversations.value = [];
+                currentConvId.value = null;
+                currentConvTitle.value = '';
+                status.value = '👋 已退出登录';
             }
 
             async function refreshAuthStatus() {
-                // 查询当前登录用户并刷新状态栏；接口不存在/未实现时按未登录处理
                 try {
-                    const response = await fetch('/api/auth/me');
-                    const r = await unwrap(response);
-                    updateAuthUI(r.data ? r.data.user : null);
-                } catch (e) {
-                    updateAuthUI(null);
-                }
-            }
-
-            function updateAuthUI(user) {
-                if (user) {
-                    authStatusEl.textContent = '👤 ' + user.username;
-                    authToggleBtn.textContent = '退出登录';
-                    authToggleBtn.onclick = doLogout;
-                } else {
-                    authStatusEl.textContent = '👤 未登录';
-                    authToggleBtn.textContent = '登录 / 注册';
-                    authToggleBtn.onclick = showAuthModal;
-                }
-                // 登录态变了，外部模型配置也变了（跟登录用户绑定），刷新下拉框
-                refreshModelsAfterAuth();
-            }
-
-            // ==================== 外部大模型配置 ====================
-            // 依赖后端 controllers/api/llm_controller.py：
-            //   连接信息（url/模型名/密钥）由操作者手动填写，不预设服务商
-            //   GET  /api/llm/providers      → 当前用户已存配置（key脱敏）
-            //   POST /api/llm/providers      → 新增 {base_url, api_key, model}
-            //   DELETE /api/llm/providers/id → 删除
-            //   POST /api/llm/test           → 连通性测试
-            const llmModal = document.getElementById('llmModal');
-            const llmBaseUrl = document.getElementById('llmBaseUrl');
-            const llmModel = document.getElementById('llmModel');
-            const llmApiKey = document.getElementById('llmApiKey');
-            const llmError = document.getElementById('llmError');
-            const llmSuccess = document.getElementById('llmSuccess');
-            const providerList = document.getElementById('providerList');
-
-            async function showLlmModal() {
-                // 配置存登录用户名下，未登录先去登录
-                try {
-                    const me = await unwrap(await fetch('/api/auth/me'));
-                    if (!me.data || !me.data.user) {
-                        alert('外部模型配置需要先登录（配置保存在你的账号下）');
-                        showAuthModal();
-                        return;
+                    const resp = await fetch('/api/auth/me');
+                    const r = await unwrap(resp);
+                    const u = (r.data && r.data.user) ? r.data.user : null;
+                    user.value = u;
+                    if (u) {
+                        // 登录后启动会话列表加载
+                        await loadConversations();
+                        await loadModels();
+                    } else {
+                        conversations.value = [];
                     }
-                } catch (e) { /* 查询失败也允许打开弹窗，保存时后端会再拦 */ }
+                } catch (e) {
+                    user.value = null;
+                    conversations.value = [];
+                }
+            }
 
-                llmError.textContent = '';
-                llmSuccess.textContent = '';
-                // 打开时清空输入框，避免沿用上一次填的连接信息
+            // ==================== 外部模型配置 ====================
+            async function showLlmConfig() {
+                if (!user.value) {
+                    alert('外部模型配置需要先登录（配置保存在你的账号下）');
+                    showAuth();
+                    return;
+                }
+                llmError.value = '';
+                llmSuccess.value = '';
                 llmBaseUrl.value = '';
-                llmModel.value = '';
+                llmModelName.value = '';
                 llmApiKey.value = '';
-                llmModal.classList.add('show');
+                showLlmModal.value = true;
                 await loadProviderList();
             }
 
-            function hideLlmModal() {
-                llmModal.classList.remove('show');
+            function hideLlmConfig() {
+                showLlmModal.value = false;
             }
 
-            llmModal.addEventListener('click', function (e) {
-                if (e.target === llmModal) hideLlmModal();
-            });
-
-            // 采集表单：url + 模型名 + api key，名称留空由后端用模型名顶上
             function collectLlmForm() {
                 return {
                     base_url: llmBaseUrl.value.trim(),
-                    model: llmModel.value.trim(),
-                    api_key: llmApiKey.value.trim()
+                    model: llmModelName.value.trim(),
+                    api_key: llmApiKey.value.trim(),
                 };
             }
 
             async function testLlmProvider() {
                 const form = collectLlmForm();
-                llmError.textContent = '';
-                llmSuccess.textContent = '⏳ 测试中...';
+                llmError.value = '';
+                llmSuccess.value = '⏳ 测试中...';
                 try {
-                    const response = await fetch('/api/llm/test', {
+                    const resp = await fetch('/api/llm/test', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(form)
+                        body: JSON.stringify(form),
                     });
-                    const r = await unwrap(response);
+                    const r = await unwrap(resp);
                     if (r.code !== 0) {
-                        llmError.textContent = '❌ ' + (r.msg || '测试失败');
-                        llmSuccess.textContent = '';
+                        llmError.value = '❌ ' + (r.msg || '测试失败');
+                        llmSuccess.value = '';
                         return;
                     }
                     const data = r.data || {};
                     if (data.ok) {
-                        llmSuccess.textContent = '✅ ' + data.message;
+                        llmSuccess.value = '✅ ' + data.message;
                     } else {
-                        llmError.textContent = '❌ ' + (data.message || '连接失败');
-                        llmSuccess.textContent = '';
+                        llmError.value = '❌ ' + (data.message || '连接失败');
+                        llmSuccess.value = '';
                     }
                 } catch (e) {
-                    llmError.textContent = '请求失败: ' + e.message;
-                    llmSuccess.textContent = '';
+                    llmError.value = '请求失败: ' + e.message;
+                    llmSuccess.value = '';
                 }
             }
 
             async function saveLlmProvider() {
                 const form = collectLlmForm();
                 if (!form.base_url || !form.model || !form.api_key) {
-                    llmError.textContent = 'URL、模型名称、API Key 都要填';
-                    llmSuccess.textContent = '';
+                    llmError.value = 'URL、模型名称、API Key 都要填';
+                    llmSuccess.value = '';
                     return;
                 }
-                llmError.textContent = '';
-                llmSuccess.textContent = '⏳ 保存中...';
+                llmError.value = '';
+                llmSuccess.value = '⏳ 保存中...';
                 try {
-                    const response = await fetch('/api/llm/providers', {
+                    const resp = await fetch('/api/llm/providers', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(form)
+                        body: JSON.stringify(form),
                     });
-                    const r = await unwrap(response);
+                    const r = await unwrap(resp);
                     if (r.code !== 0) {
-                        llmError.textContent = r.msg || '保存失败';
-                        llmSuccess.textContent = '';
+                        llmError.value = r.msg || '保存失败';
+                        llmSuccess.value = '';
                         return;
                     }
-                    llmSuccess.textContent = '✅ 已保存';
+                    llmSuccess.value = '✅ 已保存';
                     llmApiKey.value = '';
-                    await Promise.all([loadProviderList(), loadModels()]);
+                    await loadProviderList();
+                    await loadModels();
                 } catch (e) {
-                    llmError.textContent = '请求失败: ' + e.message;
-                    llmSuccess.textContent = '';
+                    llmError.value = '请求失败: ' + e.message;
+                    llmSuccess.value = '';
                 }
             }
 
             async function loadProviderList() {
                 try {
-                    const response = await fetch('/api/llm/providers');
-                    if (response.status === 401) {
-                        providerList.innerHTML = '<div class="hint">未登录，暂无配置</div>';
+                    const resp = await fetch('/api/llm/providers');
+                    if (resp.status === 401) {
+                        providerList.value = [];
                         return;
                     }
-                    const data = (await unwrap(response)).data || {};
-                    providerList.innerHTML = '';
-                    (data.providers || []).forEach(p => {
-                        const item = document.createElement('div');
-                        item.className = 'provider-item';
-
-                        const info = document.createElement('div');
-                        const title = (p.name && p.name !== p.model) ? p.name : p.model;
-                        info.innerHTML = '<strong>' + title + '</strong><br>' +
-                            '<span style="color:#999">' + p.model + ' · ' + p.api_key + '</span>';
-
-                        const delBtn = document.createElement('button');
-                        delBtn.className = 'del-btn';
-                        delBtn.textContent = '删除';
-                        delBtn.onclick = async () => {
-                            if (!confirm('删除配置「' + title + '」？')) return;
-                            await fetch('/api/llm/providers/' + p.id, { method: 'DELETE' });
-                            await Promise.all([loadProviderList(), loadModels()]);
-                        };
-
-                        item.appendChild(info);
-                        item.appendChild(delBtn);
-                        providerList.appendChild(item);
-                    });
-                    if ((data.providers || []).length === 0) {
-                        providerList.innerHTML = '<div class="hint">还没有保存的配置</div>';
-                    }
+                    const r = await unwrap(resp);
+                    providerList.value = (r.data && r.data.providers) || [];
                 } catch (e) {
-                    providerList.innerHTML = '<div class="hint">加载失败: ' + e.message + '</div>';
+                    providerList.value = [];
                 }
             }
 
-            // 页面加载完成后恢复登录状态（放在末尾，确保上面的DOM引用已初始化）
-            refreshAuthStatus();
-        </script>
-    </body>
-    </html>
+            async function deleteLlmProvider(id) {
+                if (!confirm('确定删除此配置？')) return;
+                await fetch('/api/llm/providers/' + id, { method: 'DELETE' });
+                await loadProviderList();
+                await loadModels();
+            }
+
+            // ==================== 生命周期 ====================
+            onMounted(() => {
+                loadModels();
+                refreshAuthStatus();
+            });
+
+            return {
+                // State
+                conversations, currentConvId, currentConvTitle, messages,
+                userInput, isProcessing, loadingConversations, loadingMessages,
+                localModels, externalProviders, modelSelect, temperature,
+                mode, status, user,
+                showAuthModal, authUsername, authPassword, authError,
+                showLlmModal, llmBaseUrl, llmModelName, llmApiKey,
+                llmError, llmSuccess, providerList,
+                chatBox,
+                // Computed
+                isExternal,
+                // Methods
+                formatTime, sendMessage, newConversation,
+                loadConversations, loadConversation,
+                loadModels, onModelChange,
+                showAuth, hideAuth, doLogin, doRegister, doLogout,
+                showLlmConfig, hideLlmConfig,
+                testLlmProvider, saveLlmProvider, deleteLlmProvider,
+            };
+        },
+    });
+
+    app.mount('#app');
+</script>
+</body>
+</html>
 '''
 
 
@@ -1054,18 +1398,20 @@ def create_app(config_name=None):
     #    登录态靠 session Cookie，前端 fetch 带 credentials:'include'，缺这个登录接口调不通。
     CORS(app, supports_credentials=True)
 
-    # 3. 数据库初始化（TiDB Cloud：users / api_logs / llm_providers 三张表）
+    # 3. 数据库初始化（TiDB Cloud：users / api_logs / llm_providers / conversations / messages）
     #    失败不阻塞启动：先降级告警，等服务起来后再补（便于离线联调 UI）。
     try:
         user_init_db()
         init_log_db()
         llm_provider_service.init_db()
+        conversation_service.init_db()
     except Exception as e:
         app.logger.warning(f"数据库自动初始化跳过或失败: {e}")
 
-    # 4. 注册业务蓝图（auth_bp / llm_bp 自带 url_prefix，这里不再重复传）
+    # 4. 注册业务蓝图（auth_bp / llm_bp / conv_bp 自带 url_prefix，这里不再重复传）
     app.register_blueprint(auth_bp)
     app.register_blueprint(llm_bp)
+    app.register_blueprint(conv_bp)
 
     # 5. 注册应用内路由（原 simple_app 中直接挂在 app 上的接口）
     _register_inline_routes(app)
@@ -1135,6 +1481,11 @@ def _register_inline_routes(app):
         当前三种模式相互独立（后续要加的"并行模式"再统一编排）：
           - rag / agent：只能走本地 Ollama（单例模型与工具调用基于本地模型）
           - llm 直接对话：可选本地 Ollama，或外部大模型（provider_id）
+
+        会话历史（已登录用户）：
+          - 前端传 conversation_id → 消息自动存入该会话
+          - 不传 conversation_id → 自动创建新会话
+          - 首条用户消息自动截取前 30 字符作为会话标题
         """
         global _rag_system, _agent_instance, _current_model
         try:
@@ -1146,10 +1497,21 @@ def _register_inline_routes(app):
             # 外部模型：前端选了 "ext:<id>" 时携带 provider_id，优先级高于本地model
             provider_id = data.get('provider_id')
 
+            # ----- 会话管理（仅登录用户） -----
+            conversation_id = data.get('conversation_id')
+            uid = session.get('user_id')
+
+            if uid:
+                # 未传 conversation_id 时自动创建新会话
+                if not conversation_id:
+                    conv = conversation_service.create_conversation(uid)
+                    conversation_id = conv['id']
+                # 保存用户消息
+                conversation_service.add_message(conversation_id, 'user', message)
+
             # 走外部模型：先取本人配置（含完整api_key），取不到说明未登录/配置被删
             provider = None
             if provider_id is not None:
-                uid = session.get('user_id')
                 if uid is None:
                     return err('使用外部模型需要先登录', 401)
                 provider = llm_provider_service.get_provider_by_id(provider_id, uid)
@@ -1173,22 +1535,33 @@ def _register_inline_routes(app):
                 return err('请输入问题', 400)
 
             # 根据前端选择的模式分发
+            reply = ''
+            trace = None
+
             if mode == 'rag':
                 reply = chat_with_rag(message, temperature)
-                return ok({'reply': reply})
-
-            if mode == 'agent':
+            elif mode == 'agent':
                 reply, trace = chat_with_agent(message)
-                return ok({'reply': reply, 'trace': trace})
-
-            # 默认直接对话：本地与外部统一走 chat_openai_compatible()
-            #   - 选了外部模型(provider) -> 直接用其 base_url/api_key/model
-            #   - 没选(本地) -> chat_with_llm 内部把 Ollama 也注册成 /v1 的 provider
-            if provider:
-                reply = llm_provider_service.chat_openai_compatible(provider, message, temperature)
             else:
-                reply = chat_with_llm(message, temperature)
-            return ok({'reply': reply})
+                # 默认直接对话：本地与外部统一走 chat_openai_compatible()
+                if provider:
+                    reply = llm_provider_service.chat_openai_compatible(provider, message, temperature)
+                else:
+                    reply = chat_with_llm(message, temperature)
+
+            # 保存 AI 回复 + 自动标题（首条消息）
+            if uid and conversation_id:
+                conversation_service.add_message(conversation_id, 'assistant', reply)
+                # 消息数量为 2（刚插入的user + assistant）时用首条消息做标题
+                conv_detail = conversation_service.get_conversation_detail(conversation_id, uid)
+                msg_count = len(conv_detail['messages']) if conv_detail else 0
+                if msg_count == 2:
+                    conversation_service.auto_title(conversation_id, message)
+
+            result = {'reply': reply, 'conversation_id': conversation_id}
+            if trace:
+                result['trace'] = trace
+            return ok(result)
 
         except Exception as e:
             return err(str(e), 500)
