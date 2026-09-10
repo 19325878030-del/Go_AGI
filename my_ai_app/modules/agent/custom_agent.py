@@ -12,14 +12,9 @@ sys.path.append(str(project_root))
 sys.stdout.reconfigure(encoding='utf-8')
 sys.stderr.reconfigure(encoding='utf-8')
 
-from my_ai_app.modules.agent.tools import (
-    get_current_weather,
-    get_weather_forecast,
-    calculator,
-    convert_units,
-    web_search,
-    has_real_results
-)
+# 工具元数据与实现分离：启动只扫 manifest（轻量），实现代码由 loader 按需加载
+from my_ai_app.modules.agent.tool_registry import ToolRegistry
+from my_ai_app.modules.agent.tool_loader import ToolLoader
 
 # 模型无法回答/无法操作时输出的标记文本，
 # chat()检测到它就会自动转入"搜索网络信息"兜底流程
@@ -32,147 +27,86 @@ class FunctionCallAgent:
 
     这个Agent模拟了OpenAI的function calling机制，
     让LLM能够自主决定调用哪些工具
+
+    模型接入与"直接对话"同构：统一走 OpenAI 兼容 /chat/completions（ExternalLLMClient）。
+    工具调用是提示词约定的JSON协议（见 _build_system_prompt），不依赖任何一家的
+    原生 function calling 接口，所以本地 Ollama 与外部大模型（DeepSeek/GLM/千问/Kimi）
+    走完全相同的代码路径，区别只在 provider 配置。
     """
 
-    def __init__(self, model_name: str = "qwen2.5:3b", ollama_url: str = "http://localhost:11434"):
+    def __init__(self, model_name: str = "qwen2.5:3b", ollama_url: str = "http://localhost:11434",
+                 provider: dict = None):
+        """
+        Args:
+            model_name: 本地 Ollama 模型名（未传 provider 时使用）
+            ollama_url: 本地 Ollama 根地址（未传 provider 时使用）
+            provider: OpenAI 兼容模型配置 {base_url, api_key, model}。
+                      传了它就以该模型运行（外部大模型直传其配置；
+                      本地 Ollama 也可注册成 base_url=http://localhost:11434/v1
+                      的 provider，同一入口）
+        """
         self.model_name = model_name
         self.ollama_url = ollama_url
-        self.tools = {}  # 工具注册表
-        self.tool_descriptions = {}  # 工具描述
 
-        # 注册工具
-        self._register_tools()
-
-        print(f"✅ Agent初始化完成，已注册 {len(self.tools)} 个工具")
-
-    def _register_tools(self):
-        """注册所有可用工具"""
-        tools = {
-            "get_weather": {
-                "function": get_current_weather,
-                "description": "获取当前天气信息",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "city": {
-                            "type": "string",
-                            "description": "城市名称"
-                        },
-                        "unit": {
-                            "type": "string",
-                            "enum": ["celsius", "fahrenheit"],
-                            "description": "温度单位",
-                            "default": "celsius"
-                        }
-                    },
-                    "required": ["city"]
-                }
-            },
-            "get_forecast": {
-                "function": get_weather_forecast,
-                "description": "获取天气预报",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "city": {
-                            "type": "string",
-                            "description": "城市名称"
-                        },
-                        "days": {
-                            "type": "integer",
-                            "description": "预报天数",
-                            "minimum": 1,
-                            "maximum": 7,
-                            "default": 3
-                        }
-                    },
-                    "required": ["city"]
-                }
-            },
-            "calculator": {
-                "function": calculator,
-                "description": "计算数学表达式",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "expression": {
-                            "type": "string",
-                            "description": "数学表达式，如 '2+3*4' 或 'sqrt(16)'"
-                        }
-                    },
-                    "required": ["expression"]
-                }
-            },
-            "convert_units": {
-                "function": convert_units,
-                "description": "单位转换（长度、温度等）",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "value": {
-                            "type": "number",
-                            "description": "要转换的数值"
-                        },
-                        "from_unit": {
-                            "type": "string",
-                            "description": "源单位"
-                        },
-                        "to_unit": {
-                            "type": "string",
-                            "description": "目标单位"
-                        }
-                    },
-                    "required": ["value", "from_unit", "to_unit"]
-                }
-            },
-            "web_search": {
-                "function": web_search,
-                "description": "搜索网络信息（返回网页摘要和Google/百度搜索链接）",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "搜索关键词"
-                        },
-                        "max_results": {
-                            "type": "integer",
-                            "description": "最大结果数",
-                            "default": 3
-                        }
-                    },
-                    "required": ["query"]
-                }
+        if provider:
+            # 与 llm_provider_service.chat_openai_compatible 用同一份配置结构
+            self.provider = {
+                "base_url": provider["base_url"],
+                "api_key": provider["api_key"],
+                "model": provider["model"],
             }
-        }
-
-        self.tools = {name: info["function"] for name, info in tools.items()}
-        self.tool_descriptions = {
-            name: {
-                "description": info["description"],
-                "parameters": info["parameters"]
+        else:
+            # 本地 Ollama：注册成 OpenAI 兼容 /v1 provider（key 仅占位，Ollama 不校验）
+            self.provider = {
+                "base_url": ollama_url.rstrip('/') + "/v1",
+                "api_key": "ollama",
+                "model": model_name,
             }
-            for name, info in tools.items()
-        }
 
-    def _call_ollama(self, messages: List[Dict], system_prompt: str = None) -> Dict:
-        """调用Ollama API"""
-        url = f"{self.ollama_url}/api/chat"
+        # 模型调用客户端（OpenAI兼容），复用 core/ 的现成实现
+        from core.external_llm_client import ExternalLLMClient
+        self._client = ExternalLLMClient(
+            base_url=self.provider["base_url"],
+            api_key=self.provider["api_key"],
+            model=self.provider["model"],
+        )
 
-        # 构建系统提示，告知模型可以使用工具（可传入覆盖，用于禁用工具直接回答）
+        # 元数据注册表（只扫 manifest，不碰实现代码）+ 按需加载器
+        self.registry = ToolRegistry()
+        self.loader = ToolLoader(self.registry)
+        # 工具Schema，供系统提示；模型只感知Schema，不感知实现
+        self.tool_descriptions = self.registry.get_schemas()
+
+        # web_search 包在 manifest 里声明的判空辅助函数（空结果兜底流程用），
+        # 首次用到才加载；未声明时兜底流程自动退化为"照常把结果喂回模型"
+        self._fallback_helper_info = self.registry.get_fallback_helper()
+        self._has_real_results_func = None
+
+        print(f"✅ Agent初始化完成（{self.provider['base_url']} / {self.provider['model']}），"
+              f"已注册 {len(self.tool_descriptions)} 个工具")
+
+    @property
+    def tools(self):
+        """兼容旧属性：已注册的工具名集合（现在工具按需加载，不再持有函数对象）"""
+        return self.registry.tool_names
+
+    def _call_model(self, messages: List[Dict], system_prompt: str = None) -> str:
+        """调用模型（OpenAI兼容 /chat/completions，本地/外部同一入口）。
+
+        返回回答文本；system_prompt 可传入覆盖（兜底流程用它禁用工具直接回答）。
+        """
         if system_prompt is None:
             system_prompt = self._build_system_prompt()
 
-        payload = {
-            "model": self.model_name,
-            "messages": [{"role": "system", "content": system_prompt}] + messages,
-            "stream": False,
-            "temperature": 0.3
-        }
+        # max_tokens 给足：Agent 需要先输出工具调用JSON再停下，给小了会被截断
+        return self._client.chat(
+            [{"role": "system", "content": system_prompt}] + messages,
+            temperature=0.3,
+            max_tokens=2048,
+        )
 
-        response = requests.post(url, json=payload)
-        response.raise_for_status()
-        return response.json()
+    # 旧名保留别名：standalone 调试等旧调用点不至于直接 AttributeError
+    _call_ollama = _call_model
 
     def _build_system_prompt(self) -> str:
         """构建系统提示，描述可用工具"""
@@ -209,10 +143,12 @@ class FunctionCallAgent:
 
     def _fallback_reply(self, user_input: str, result: Any) -> str:
         """
-        组装兜底回复：AI回答在前，搜索链接在后。
+        组装兜底回复：联网搜索已执行但无真实命中时的最终输出。
 
         搜索没有真实命中时，模型下一轮只会复述兜底链接、给不出实质内容，
-        所以这里不再把结果喂回模型，而是确定性地拼出最终回复。
+        所以这里不再把结果喂回模型，而是确定性地拼出最终回复：
+        说明性头部（固定生成，不让模型自由发挥）+ 基于已有知识的回答 + 自查链接。
+        内部协议标记 CANNOT_ANSWER_MARKER 只用于循环内检测模型输出，不进用户可见文本。
         """
         ai_answer = self._answer_without_tools(user_input)
 
@@ -223,9 +159,9 @@ class FunctionCallAgent:
                     links.append(f"- {item.get('title', '链接')}: {item['link']}")
 
         return (
+            "以下回答基于模型已有知识（未联网检索），仅供参考：\n\n"
             f"{ai_answer}\n\n"
-            f"{CANNOT_ANSWER_MARKER}\n"
-            f"你可以参考以下链接寻找解决方法:\n"
+            "🔎 点击链接可在浏览器打开该问题的搜索页：\n"
             + "\n".join(links)
         )
 
@@ -233,16 +169,20 @@ class FunctionCallAgent:
         """
         绕过工具直接让AI回答。
 
-        兜底场景使用：模型已声明无法操作，此时不再引导它调工具
-        （它自己说了答不了），而是换一个不带工具说明的系统提示，
-        让它凭已有知识先给出一个尽力而为的答案。
+        兜底场景使用：web_search 只生成搜索链接、无检索结果可喂回，
+        于是换一个不带工具说明的系统提示，让模型凭已有知识尽力回答，
+        并附上各引擎的搜索链接供用户自行查阅。
         """
         messages = [{"role": "user", "content": user_input}]
-        response = self._call_ollama(
+        answer = self._call_model(
             messages,
-            system_prompt="你是一个智能助手。请根据你已有的知识，尽最大努力回答用户的问题或给出解决思路。不要输出任何JSON或工具调用。"
+            system_prompt=(
+                "你是一个智能助手。请直接基于你已有的知识回答问题或给出解决思路。"
+                "直接给实质内容：不要声明自己无法联网或建议用户去搜索"
+                "（系统会自动附上搜索链接），不要输出任何JSON或工具调用。"
+            )
         )
-        answer = response.get("message", {}).get("content", "").strip()
+        answer = (answer or '').strip()
         return answer if answer else "抱歉，我暂时无法回答这个问题。"
 
     def _parse_tool_call(self, response: str) -> Dict:
@@ -268,13 +208,20 @@ class FunctionCallAgent:
                 idx = start + 1
         return None
 
+    def _get_has_real_results(self):
+        """惰性取"搜索结果判空"辅助函数（manifest 的 fallback_helper 声明）"""
+        if self._has_real_results_func is None and self._fallback_helper_info:
+            self._has_real_results_func = self.loader.get_helper_function(self._fallback_helper_info)
+        return self._has_real_results_func
+
     def _execute_tool(self, tool_name: str, parameters: Dict) -> Any:
-        """执行工具"""
-        if tool_name not in self.tools:
+        """执行工具（按需加载实现后调用）"""
+        func = self.loader.get_function(tool_name)
+        if func is None:
             return f"错误：未知工具 '{tool_name}'"
 
         try:
-            result = self.tools[tool_name](**parameters)
+            result = func(**parameters)
             return result
         except Exception as e:
             return f"工具执行错误: {str(e)}"
@@ -298,10 +245,8 @@ class FunctionCallAgent:
         print(f"\n👤 用户: {user_input}")
 
         while iteration < max_iterations:
-            # 调用模型
-            response = self._call_ollama(messages)
-            assistant_message = response.get("message", {})
-            content = assistant_message.get("content", "")
+            # 调用模型（OpenAI兼容接口，返回回答文本）
+            content = self._call_model(messages) or ""
 
             # 检查是否包含工具调用
             tool_call = self._parse_tool_call(content)
@@ -328,7 +273,8 @@ class FunctionCallAgent:
                 # 搜索没有真实命中（只剩Google/百度兜底链接或失败提示）时，
                 # 不把结果喂回模型——小模型面对空结果只会复述链接，
                 # 改为确定性地输出：AI回答在前 + 链接在后
-                if tool_name == "web_search" and not has_real_results(result):
+                has_real_results = self._get_has_real_results()
+                if tool_name == "web_search" and has_real_results and not has_real_results(result):
                     final_reply = self._fallback_reply(user_input, result)
                     print(f"🤖 Agent: {final_reply}")
                     return final_reply
@@ -337,9 +283,15 @@ class FunctionCallAgent:
                 # 注意：存入的是解析出的干净JSON指令，而不是模型原文——
                 # 小模型原文里常夹带它自己编造的"工具结果"，混入历史会误导后续轮次
                 messages.append({"role": "assistant", "content": json.dumps(tool_call, ensure_ascii=False)})
+                # 工具结果用 user 角色回灌并明确标注"系统注入"：
+                # OpenAI 兼容接口要求 role=tool 必须带 tool_call_id、assistant 带
+                # tool_calls 数组，裸 tool 消息会被外部服务商静默丢弃（本地 Ollama
+                # 原生 API 才宽容）——模型收不到结果，只能凭空说"无法获取"。
                 messages.append({
-                    "role": "tool",
-                    "content": json.dumps(result, ensure_ascii=False)
+                    "role": "user",
+                    "content": (f"[系统] 工具 {tool_name} 已执行，返回结果如下"
+                                f"（请基于此结果回答，不要再说无法获取）：\n"
+                                + json.dumps(result, ensure_ascii=False))
                 })
 
                 iteration += 1

@@ -1,0 +1,45 @@
+{
+  "package": "calculator",
+  "version": "1.0.0",
+  "entry_module": "implementation.py",
+  "tools": [
+    {
+      "name": "calculator",
+      "description": "计算数学表达式",
+      "entry_function": "calculator",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "expression": {
+            "type": "string",
+            "description": "数学表达式，如 '2+3*4' 或 'sqrt(16)'"
+          }
+        },
+        "required": ["expression"]
+      }
+    },
+    {
+      "name": "convert_units",
+      "description": "单位转换（长度、温度等）",
+      "entry_function": "convert_units",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "value": {
+            "type": "number",
+            "description": "要转换的数值"
+          },
+          "from_unit": {
+            "type": "string",
+            "description": "源单位"
+          },
+          "to_unit": {
+            "type": "string",
+            "description": "目标单位"
+          }
+        },
+        "required": ["value", "from_unit", "to_unit"]
+      }
+    }
+  ]
+}

@@ -13,10 +13,11 @@
 | `.env` | TiDB 连接配置（不提交 git，向前任维护者索取） | ✅ |
 | `controllers/` | 接口层：auth 登录注册接口（契约见其 README） | ✅ |
 | `services/` | 业务层：`db` / `user_service` / `log_service`（契约见其 README） | ✅ |
-| `modules/agent/` | FunctionCallAgent + 工具（天气 / 计算器 / 搜索） | ✅ |
-| `modules/rag/` | RAG 系统（文档加载 / 向量库 / 问答链） | ✅ |
+| `modules/agent/` | FunctionCallAgent + `tool_registry`（扫 manifest 元数据）+ `tool_loader`（importlib 按需加载，含 sha256 校验与云端拉取占位） | ✅ |
+| `modules/rag/` | RAG 能力：`rag_ingest.py` 上传建库（txt/md/pdf/docx → 分块 → Ollama嵌入 → 本地 Chroma）+ `rag_service.py` 检索问答（生成模型随前端所选本地/外部） | ✅ |
 | `core/` | LLM API 客户端、Ollama API server 等实验代码 | ✅ |
-| `data/` | 运行时数据：`sample.txt`、`chroma_db/`、`logs/`、TiDB 证书（说明见其 README） | ✅ |
+| `data/` | 运行时数据：`chroma_db/`（命名向量库）、`logs/`、TiDB 证书（说明见其 README） | ✅ |
+| `data/agent_tools/` | Agent 工具包：`weather` / `calculator` / `web_search` 三包，每包 `manifest.json`（工具Schema元数据）+ `implementation.py`（实现，模型调用后才动态加载） | ✅ |
 | `tests/subprocess.run.py` | Pinggy 内网穿透隧道脚本（本机 5001 → 公网 HTTPS） | ✅ |
 | `controllers/api/chat_controller.py`（将来） | 把 `/api/chat`、`/api/models` 从 `simple_app.py` 迁入接口层 | 规划中 |
 | `services/chat_history_service.py`（将来） | 对话历史存储 | 规划中 |
@@ -95,7 +96,9 @@ python my_ai_app\simple_app.py
 
 | 方法 | 路径 | 请求体 | 成功 `data` | 说明 |
 |---|---|---|---|---|
-| POST | `/api/chat` | `{"message","mode":"agent\|rag\|llm","temperature","model","provider_id?"}` | `{"reply","trace?"}` | 按模式分发；agent 额外返回工具调用轨迹 |
+| POST | `/api/chat` | `{"message","mode":"agent\|rag\|llm","temperature","model","provider_id?","collection_name?"}` | `{"reply","trace?"}` | 按模式分发；三种模式均支持本地 Ollama 或外部模型（`provider_id`，需登录）；agent 额外返回工具调用轨迹；rag 需带 `collection_name`（前端所选知识库），检索仍用本地嵌入模型 |
+| GET | `/api/rag/collections` | — | `{"collections":[{name,display_name,count}],"error"?}` | 列出本机已有知识库，供前端下拉选择；`name` 为合法集合名，`display_name` 为用户可见名（中文） |
+| POST | `/api/rag/collections` | multipart：`collection_name` + `files[]` | `{"collection","display_name","total_chunks","files":[{file,chunks,ok,error}]}` | 前端上传文档生成向量库（支持 txt/md/pdf/docx）；同名库重复上传=增量，同文件覆盖不重复；中文库名自动 slug 化 |
 | GET | `/api/models` | — | `{"models","current","providers","error"}` | `error` 可为 null（Ollama 拉取失败时的信息） |
 | GET | `/api/health` | — | `{"status","environment","service"}` | 健康检查（负载均衡探活） |
 | POST | `/api/auth/register` | `{"username","password"}` | `{"username"}` | 注册即登录；用户名 ≥2 字符、密码 ≥6 位 |
@@ -128,7 +131,7 @@ python scripts\tunnel.py
 
 1. `python my_ai_app\simple_app.py` 启动无报错，页面打开且模型下拉框有值（说明 Ollama 正常）
 2. 直接对话模式发一条消息能收到回复；Agent 模式能看到工具调用轨迹
-3. RAG 模式首次提问慢（建向量库）属正常，之后明显变快
+3. RAG 模式：点「⬆ 上传建库」传 1 个 txt（起个中文名）→ 提示入库成功且下拉自动选中该库 → 对库内内容提问（如文档里写的报销标准），回答引用库内内容；未命中时回答前带 `<#未能在标准中找到#>` 标注
 4. 注册 `tom / 123456` → 弹窗关闭，状态栏显示 `👤 tom`
 5. `data/logs/api_requests.jsonl` 能看到每个接口的入参/出参记录（联调时 tail 查看）
 6. 跑通隧道脚本后，用打印出的公网 URL 在另一台设备打开页面可正常对话
