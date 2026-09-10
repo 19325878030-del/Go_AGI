@@ -1,5 +1,6 @@
 {
   "package": "weather",
+  "display_name": "天气查询",
   "version": "1.0.0",
   "entry_module": "implementation.py",
   "tools": [

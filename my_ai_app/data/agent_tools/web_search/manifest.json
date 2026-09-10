@@ -1,5 +1,6 @@
 {
   "package": "web_search",
+  "display_name": "联网搜索",
   "version": "2.0.0",
   "entry_module": "implementation.py",
   "tools": [

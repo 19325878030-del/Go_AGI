@@ -1,6 +1,7 @@
 # my_ai_app/modules/agent/custom_agent.py
 import sys
 import json
+import hashlib
 from pathlib import Path
 from typing import List, Dict, Any, Callable
 import requests
@@ -20,6 +21,24 @@ from my_ai_app.modules.agent.tool_loader import ToolLoader
 # chat()检测到它就会自动转入"搜索网络信息"兜底流程
 CANNOT_ANSWER_MARKER = "<#我无法操作,你可以->#>"
 
+# ==================== 知识库工具（Agent + RAG 并行模式） ====================
+# 该工具不在 data/agent_tools/ 注册表里 —— 它没有本地实现文件，
+# 实现由调用方通过 knowledge_getter 注入（并行模式下是 RAG 检索器）。
+# 所以它只在传了 knowledge_getter 时才出现在系统提示里。
+KNOWLEDGE_TOOL_NAME = "rag_search"
+KNOWLEDGE_TOOL_SCHEMA = {
+    "description": "从本地知识库（上传的文档/规范）中检索相关段落。"
+                   "遇到你不确定、或需要依据文档作答的问题时先调用它，"
+                   "它是联网搜索（web_search）之前的第一选择。",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "检索关键词或问题"}
+        },
+        "required": ["query"],
+    },
+}
+
 
 class FunctionCallAgent:
     """
@@ -32,6 +51,10 @@ class FunctionCallAgent:
     工具调用是提示词约定的JSON协议（见 _build_system_prompt），不依赖任何一家的
     原生 function calling 接口，所以本地 Ollama 与外部大模型（DeepSeek/GLM/千问/Kimi）
     走完全相同的代码路径，区别只在 provider 配置。
+
+    工具集可按请求过滤：chat(tool_packages=[...]) 由前端按工具包勾选，
+    每轮只把启用包里的工具写进系统提示；无法操作标记触发的联网兜底
+    流程不受过滤影响（那是 Agent 自身的保底行为，不依赖模型选工具）。
     """
 
     def __init__(self, model_name: str = "qwen2.5:3b", ollama_url: str = "http://localhost:11434",
@@ -74,7 +97,7 @@ class FunctionCallAgent:
         # 元数据注册表（只扫 manifest，不碰实现代码）+ 按需加载器
         self.registry = ToolRegistry()
         self.loader = ToolLoader(self.registry)
-        # 工具Schema，供系统提示；模型只感知Schema，不感知实现
+        # 全量工具Schema（系统提示按请求过滤后引用它；模型只感知Schema，不感知实现）
         self.tool_descriptions = self.registry.get_schemas()
 
         # web_search 包在 manifest 里声明的判空辅助函数（空结果兜底流程用），
@@ -108,12 +131,35 @@ class FunctionCallAgent:
     # 旧名保留别名：standalone 调试等旧调用点不至于直接 AttributeError
     _call_ollama = _call_model
 
-    def _build_system_prompt(self) -> str:
-        """构建系统提示，描述可用工具"""
+    def _build_system_prompt(self, with_knowledge_tool: bool = False,
+                             tool_packages: List[str] = None) -> str:
+        """构建系统提示，描述可用工具。
+
+        tool_packages 非空时只列出这些包里的工具（前端按工具包勾选）；
+        None/空列表 = 全部注册的工具。传入的包名应先经
+        registry.resolve_package_names 归一化，未知包查不到工具、自然不会出现。
+
+        with_knowledge_tool=True（Agent + RAG 并行模式）时额外声明 rag_search，
+        并把"不了解先查知识库、知识库没有再联网"写成明确规则。
+        """
+        schemas = self.registry.get_schemas(tool_packages)
+
         tools_desc = []
-        for name, info in self.tool_descriptions.items():
+        if with_knowledge_tool:
+            tools_desc.append(f"- {KNOWLEDGE_TOOL_NAME}: {KNOWLEDGE_TOOL_SCHEMA['description']}")
+            tools_desc.append(f"  参数: {json.dumps(KNOWLEDGE_TOOL_SCHEMA['parameters'], ensure_ascii=False)}")
+        for name, info in schemas.items():
             tools_desc.append(f"- {name}: {info['description']}")
             tools_desc.append(f"  参数: {json.dumps(info['parameters'], ensure_ascii=False)}")
+
+        # 并行模式追加的两条规则：知识库是第一顺位，联网搜索是第二顺位
+        kb_rules = ""
+        if with_knowledge_tool:
+            kb_rules = f"""
+6. 【知识库优先】遇到你不确定、或需要依据文档/规范作答的问题，先调用
+   {KNOWLEDGE_TOOL_NAME} 查本地知识库，不要直接跳到 web_search；
+   知识库确实没有相关内容时，再联网搜索。
+7. 知识库返回的内容是权威依据，请据此作答，不要编造库里没有的条款或数字。"""
 
         return f"""你是一个智能助手，可以调用工具来帮助回答问题。
 你可以使用以下工具：
@@ -137,7 +183,7 @@ class FunctionCallAgent:
    先输出标记 <#我无法操作,你可以->#>，然后调用 web_search 工具
    去Google或百度上搜索解决方法
 5. 先用你已有的知识回答问题，只有知识确实不够时才调用工具；
-   不要只回复搜索链接而不给出实质内容
+   不要只回复搜索链接而不给出实质内容{kb_rules}
 
 如果需要多个工具，可以分步调用。"""
 
@@ -208,6 +254,25 @@ class FunctionCallAgent:
                 idx = start + 1
         return None
 
+    @staticmethod
+    def _format_knowledge(kb: Dict) -> str:
+        """把知识库检索结果整理成回灌给模型的文本；未命中返回空串"""
+        if not kb or not kb.get("found") or not kb.get("context"):
+            return ""
+        source = kb.get("collection") or "知识库"
+        return f"【来源库：{source}】\n{kb['context']}"
+
+    @staticmethod
+    def _knowledge_brief(kb: Dict) -> Dict:
+        """知识库检索结果的精简版（进 trace 给前端展示，不含整段上下文）"""
+        if not kb:
+            return {"found": False, "error": "知识库不可用"}
+        return {
+            "collection": kb.get("collection"),
+            "found": bool(kb.get("found")),
+            "sources": kb.get("sources", []),
+        }
+
     def _get_has_real_results(self):
         """惰性取"搜索结果判空"辅助函数（manifest 的 fallback_helper 声明）"""
         if self._has_real_results_func is None and self._fallback_helper_info:
@@ -226,7 +291,8 @@ class FunctionCallAgent:
         except Exception as e:
             return f"工具执行错误: {str(e)}"
 
-    def chat(self, user_input: str, max_iterations: int = 3, trace: List[Dict] = None) -> str:
+    def chat(self, user_input: str, max_iterations: int = 3, trace: List[Dict] = None,
+             knowledge_getter: Callable = None, tool_packages: List[str] = None) -> str:
         """
         与Agent对话
 
@@ -234,19 +300,74 @@ class FunctionCallAgent:
             user_input: 用户输入
             max_iterations: 最大迭代次数
             trace: 可选列表，每次工具调用会以
-                {"tool": 名称, "parameters": 参数, "result": 结果} 追加进来
+                {"tool": 名称, "parameters": 参数, "result": 结果} 追加进来；
+                并行模式下的知识库检索记为 tool="rag_search"、type="rag"
+            knowledge_getter: 可选的知识库检索回调 get(query) -> dict | None
+                （由 modules/rag/knowledge_bridge.PrefetchKnowledgeSource 提供）。
+                不传 = 普通 Agent 模式，行为与原来完全一致
+            tool_packages: 本次启用的工具包名列表（前端勾选；display_name 也可）。
+                None/空 = 全部包。空列表归一化后一个包都不剩 = 系统提示不列任何
+                工具（此时模型不该调工具；真调了会被"未启用"回灌拦下）
 
         Returns:
             Agent的回答
         """
+        # 前端勾选的包名归一化（display_name/包名均可）；None = 不过滤（全部包）
+        enabled_packages = self.registry.resolve_package_names(tool_packages)
+
+        use_kb = callable(knowledge_getter)
         messages = [{"role": "user", "content": user_input}]
         iteration = 0
+        kb_injected = False   # 本轮是否已回灌过知识库内容（web_search 拦截只做一次）
+        asked_queries = set()  # 已问过知识库的关键词，避免同一问题反复检索
+        injected_fps = set()   # 已回灌的知识片段指纹，避免重复占用上下文
+
+        def ask_knowledge(query: str):
+            """查本地知识库，返回 (kb 结果, 可回灌给模型的文本)。
+
+            文本为空串 = 没有新的可回灌内容（库不可用 / 没命中 / 同一段已灌过），
+            此时 kb 仍可能非空（表示"查过了，库里没有"），供调用方决定下一步。
+            无论命中与否都记进 trace —— 前端要能看见"先去 rag 了解"这一步。
+            """
+            nonlocal kb_injected
+            if not use_kb:
+                return None, ""
+
+            query = (query or "").strip() or user_input
+            key = query.lower()
+            if key in asked_queries:
+                return None, ""
+            asked_queries.add(key)
+
+            kb = knowledge_getter(query)
+            if trace is not None:
+                trace.append({
+                    "tool": KNOWLEDGE_TOOL_NAME,
+                    "type": "rag",
+                    "parameters": {"query": query},
+                    "result": self._knowledge_brief(kb),
+                })
+            if not kb or not kb.get("found") or not kb.get("context"):
+                return kb, ""
+
+            fp = hashlib.md5(kb["context"].encode("utf-8")).hexdigest()
+            if fp in injected_fps:
+                return kb, ""
+            injected_fps.add(fp)
+            kb_injected = True
+            return kb, self._format_knowledge(kb)
 
         print(f"\n👤 用户: {user_input}")
+        if enabled_packages is not None:
+            print(f"🧰 工具包: {', '.join(enabled_packages) or '（未启用任何工具包）'}")
 
         while iteration < max_iterations:
             # 调用模型（OpenAI兼容接口，返回回答文本）
-            content = self._call_model(messages) or ""
+            content = self._call_model(
+                messages,
+                system_prompt=self._build_system_prompt(
+                    with_knowledge_tool=use_kb, tool_packages=enabled_packages),
+            ) or ""
 
             # 检查是否包含工具调用
             tool_call = self._parse_tool_call(content)
@@ -254,7 +375,60 @@ class FunctionCallAgent:
             if tool_call and "tool" in tool_call:
                 # 执行工具
                 tool_name = tool_call["tool"]
-                parameters = tool_call.get("parameters", {})
+                parameters = tool_call.get("parameters", {}) or {}
+
+                # 【并行模式】知识库工具：没有本地实现包，直接走注入的检索器
+                if tool_name == KNOWLEDGE_TOOL_NAME:
+                    _, inject_text = ask_knowledge(parameters.get("query"))
+                    messages.append({"role": "assistant",
+                                     "content": json.dumps(tool_call, ensure_ascii=False)})
+                    if inject_text:
+                        messages.append({
+                            "role": "user",
+                            "content": (f"[系统] 以下是本地知识库的检索结果：\n\n{inject_text}\n\n"
+                                        "（请优先基于这些内容回答，不要再说无法获取）")
+                        })
+                    else:
+                        messages.append({
+                            "role": "user",
+                            "content": "[系统] 本地知识库中没有检索到相关内容，"
+                                       "请改用其它工具，或基于你已有的知识回答。"
+                        })
+                    iteration += 1
+                    continue
+
+                # 模型调了本轮未启用的工具（前端没勾对应包/包不存在）：不加载实现，
+                # 把事实回灌，让它改用系统提示里列出的工具或凭已有知识回答。
+                # 注意：web_search 拦截与无法操作兜底在后面，不受这里影响。
+                if enabled_packages is not None and tool_name not in \
+                        self.registry.get_schemas(enabled_packages):
+                    messages.append({"role": "assistant",
+                                     "content": json.dumps(tool_call, ensure_ascii=False)})
+                    messages.append({
+                        "role": "user",
+                        "content": (f"[系统] 工具 {tool_name} 未启用（本次可用工具"
+                                    "以系统提示中列出的为准），请改用列出的工具，"
+                                    "或基于你已有的知识回答。")
+                    })
+                    iteration += 1
+                    continue
+
+                # 【并行模式】模型要走联网搜索，说明它不了解 —— 先替它查本地知识库，
+                # 命中就用知识库内容作答（"不了解的先去 rag 里了解"），没命中才真去搜
+                if tool_name == "web_search" and use_kb and not kb_injected:
+                    _, inject_text = ask_knowledge(user_input)
+                    if inject_text:
+                        print("📚 模型想联网搜索，先改走本地知识库（命中）")
+                        messages.append({"role": "assistant",
+                                         "content": json.dumps(tool_call, ensure_ascii=False)})
+                        messages.append({
+                            "role": "user",
+                            "content": (f"[系统] 先不用联网 —— 本地知识库里有相关内容：\n\n"
+                                        f"{inject_text}\n\n"
+                                        "（请优先基于这些内容回答；确实不够再调用 web_search）")
+                        })
+                        iteration += 1
+                        continue
 
                 print(f"🔧 调用工具: {tool_name}")
                 print(f"📋 参数: {json.dumps(parameters, ensure_ascii=False)}")
@@ -298,8 +472,26 @@ class FunctionCallAgent:
                 continue
 
             # 没有工具调用，但模型声明了无法回答/无法操作——
-            # 兜底流程：先让AI凭已有知识回答，再附上Google/百度搜索链接
+            # 【并行模式】先去 rag 里了解：知识库命中就据其作答；
+            # 没命中再走原来的兜底流程（AI 已有知识 + 搜索链接）
             if CANNOT_ANSWER_MARKER in content:
+                _, inject_text = ask_knowledge(user_input)
+                if inject_text:
+                    print("📚 Agent表示无法操作，改由本地知识库作答（命中）")
+                    messages.append({
+                        "role": "assistant",
+                        # 把标记从历史里去掉：否则模型下一轮可能复述它，又触发一次兜底
+                        "content": content.replace(CANNOT_ANSWER_MARKER, "").strip()
+                                   or "我不确定这个问题的答案。",
+                    })
+                    messages.append({
+                        "role": "user",
+                        "content": (f"[系统] 以下是本地知识库的检索结果：\n\n{inject_text}\n\n"
+                                    "（请基于这些内容回答，不要再说无法获取）")
+                    })
+                    iteration += 1
+                    continue
+
                 print("🤔 Agent表示无法操作，先用AI直接回答，再附上搜索链接")
 
                 search_query = user_input  # 用原始问题作为搜索词最贴近用户意图
@@ -352,13 +544,46 @@ class FunctionCallAgent:
                 print(f"❌ 错误: {e}")
 
 
-if __name__ == "__main__":
+def demo_with_knowledge():
+    """Agent + RAG 并行模式的自测入口（需本机已建知识库 + Ollama 在跑）。
+
+    用法：python -m my_ai_app.modules.agent.custom_agent "你们公司的报销标准是多少"
+    不传问题时进入交互模式。没有调用方注入检索器时走普通 Agent 模式。
+    """
     agent = FunctionCallAgent()
 
-    # 命令行参数带问题时逐个提问，否则进入交互模式
-    questions = sys.argv[1:]
-    if questions:
-        for q in questions:
-            agent.chat(q)
+    question = " ".join(sys.argv[1:]) or "你好"
+    trace = []
+
+    try:
+        from my_ai_app.modules.rag.rag_service import RAGService
+        from my_ai_app.modules.rag.knowledge_bridge import PrefetchKnowledgeSource
+
+        source = PrefetchKnowledgeSource(RAGService()).start(question)
+        getter = source.get
+    except Exception as e:
+        print(f"⚠️ 知识库不可用，降级为普通 Agent 模式: {e}")
+        getter = None
+
+    reply = agent.chat(question, trace=trace, knowledge_getter=getter)
+    print(f"\n🤖 回答: {reply}")
+    print(f"🔧 轨迹: {json.dumps(trace, ensure_ascii=False, indent=2)}")
+    if getter:
+        print(f"📚 检索: {json.dumps(source.summary(), ensure_ascii=False, indent=2)}")
+
+
+if __name__ == "__main__":
+    # --kb：带知识库的并行模式自测；否则是原来的普通 Agent 交互/单问模式
+    if "--kb" in sys.argv:
+        sys.argv.remove("--kb")
+        demo_with_knowledge()
     else:
-        agent.interactive_chat()
+        agent = FunctionCallAgent()
+
+        # 命令行参数带问题时逐个提问，否则进入交互模式
+        questions = sys.argv[1:]
+        if questions:
+            for q in questions:
+                agent.chat(q)
+        else:
+            agent.interactive_chat()

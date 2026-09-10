@@ -390,6 +390,10 @@ INDEX_HTML = '''
                     🤖 Agent模式（工具调用）
                 </label>
                 <label>
+                    <input type="radio" name="mode" id="modeAgentRag" value="agent_rag">
+                    ⚡ 并行模式（Agent+RAG）
+                </label>
+                <label>
                     <input type="radio" name="mode" id="modeRag" value="rag">
                     📚 RAG模式（知识库）
                 </label>
@@ -399,6 +403,10 @@ INDEX_HTML = '''
                 </label>
             </div>
             <div class="mode-hint" id="modeHint">⚠️ 外部模型需登录后使用。</div>
+            <!-- Agent / 并行模式的工具包勾选：列表来自 GET /api/agent/tools，默认全选 -->
+            <div class="controls" id="toolPackagesRow" style="flex-wrap: wrap;">
+                <span style="color:#666;">🧰 工具包：</span>
+            </div>
             <div class="controls">
                 <label>
                     模型：<select id="modelSelect"><option value="">加载中。。。</option></select>
@@ -491,6 +499,7 @@ INDEX_HTML = '''
             const status = document.getElementById('status');
             const modelSelect = document.getElementById('modelSelect');
             const ragCollectionSelect = document.getElementById('ragCollectionSelect');
+            const toolPackagesRow = document.getElementById('toolPackagesRow');
 
             // 统一响应信封：所有数据接口返回 {code,msg,data}；code===0 成功，否则 data=null、msg=错误文本。
             // HTTP 状态码保留（401 触发登录弹窗）。unwrap 把响应解包成 {code,msg,data} 便于取用。
@@ -619,6 +628,50 @@ INDEX_HTML = '''
             }
             loadRagCollections();
 
+            // ==================== 工具包勾选（Agent / 并行模式） ====================
+            // 列表来自 GET /api/agent/tools（扫 data/agent_tools/*/manifest.json）。
+            // 勾选值用包名（package），label 显示 display_name；默认全选；
+            // Agent / 并行模式发送时要求至少勾一个，RAG / 直接对话不传该字段。
+            function loadToolPackages() {
+                fetch('/api/agent/tools')
+                    .then(r => unwrap(r))
+                    .then(r => {
+                        const pkgs = (r.data && r.data.tools) || [];
+                        // 记住当前勾选（重渲染后恢复）
+                        const prev = getSelectedToolPackages();
+                        toolPackagesRow.querySelectorAll('label, span').forEach(el => el.remove());
+                        if (pkgs.length === 0) {
+                            const span = document.createElement('span');
+                            span.style.color = '#999';
+                            span.textContent = '暂无工具包';
+                            toolPackagesRow.appendChild(span);
+                            return;
+                        }
+                        pkgs.forEach(p => {
+                            const label = document.createElement('label');
+                            const cb = document.createElement('input');
+                            cb.type = 'checkbox';
+                            cb.value = p.package;
+                            // 默认全选；恢复上次选择（prev 空数组 = 全不选也如实恢复）
+                            cb.checked = prev.length ? prev.includes(p.package) : true;
+                            label.appendChild(cb);
+                            label.appendChild(document.createTextNode(
+                                ' ' + (p.display_name || p.package)));
+                            label.title = (p.tools || []).map(t => t.name).join('、');
+                            toolPackagesRow.appendChild(label);
+                        });
+                    })
+                    .catch(e => {
+                        toolPackagesRow.innerHTML = '<span style="color:#e74c3c;">工具包加载失败</span>';
+                    });
+            }
+
+            function getSelectedToolPackages() {
+                return Array.from(toolPackagesRow.querySelectorAll('input[type="checkbox"]:checked'))
+                    .map(cb => cb.value);
+            }
+            loadToolPackages();
+
             // ==================== 上传文档建库 ====================
             // 依赖后端 POST /api/rag/collections（multipart）：
             //   collection_name=库名（中文可） + files=文档列表
@@ -717,11 +770,19 @@ INDEX_HTML = '''
                 const message = userInput.value.trim();
                 if (!message) return;
 
-                const ragMode = getMode() === 'rag';
-                // RAG 模式必须选中知识库（向量库），名字作为 collection_name 传给后端
+                const mode = getMode();
+                const ragMode = mode === 'rag';
+                // 只有 RAG 模式必须选中知识库；并行模式不选=跨全部库检索
                 if (ragMode && !ragCollectionSelect.value) {
                     status.textContent = '⚠️ 请先选择知识库（向量库）再提问';
                     userInput.focus();
+                    return;
+                }
+                // Agent / 并行模式必须至少勾一个工具包（后端空数组=不启用任何工具）
+                const usesTools = (mode === 'agent' || mode === 'agent_rag');
+                const selectedPackages = getSelectedToolPackages();
+                if (usesTools && selectedPackages.length === 0) {
+                    status.textContent = '⚠️ 请至少勾选一个工具包（或改用其他模式）';
                     return;
                 }
 
@@ -738,18 +799,25 @@ INDEX_HTML = '''
                     // 选中 ext:<id> 时走外部模型（带provider_id），否则走本地Ollama（带model）
                     const sel = modelSelect.value;
                     const isExternal = sel.startsWith('ext:');
-                    const response = await fetch('/api/chat', {
+                    // 并行模式是独立端点（不含 mode 字段）；其余模式统一走 /api/chat
+                    const url = mode === 'agent_rag' ? '/api/chat/parallel' : '/api/chat';
+                    const body = {
+                        message: message,
+                        temperature: parseFloat(temperature.value),
+                        model: isExternal ? null : sel,
+                        provider_id: isExternal ? parseInt(sel.slice(4), 10) : null,
+                        // RAG 模式用前端选中的库；并行模式选了就限定该库，没选=跨全部库
+                        collection_name: (ragMode || mode === 'agent_rag') && ragCollectionSelect.value
+                            ? ragCollectionSelect.value : null,
+                        // Agent / 并行模式传勾选的工具包；其余模式不传（后端忽略）
+                        tool_packages: usesTools ? selectedPackages : undefined
+                    };
+                    if (mode !== 'agent_rag') body.mode = mode;
+
+                    const response = await fetch(url, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            message: message,
-                            mode: getMode(),
-                            temperature: parseFloat(temperature.value),
-                            model: isExternal ? null : sel,
-                            provider_id: isExternal ? parseInt(sel.slice(4), 10) : null,
-                            // RAG 模式：用前端选中的知识库名
-                            collection_name: ragMode ? ragCollectionSelect.value : null
-                        })
+                        body: JSON.stringify(body)
                     });
 
                     // 后端启用登录保护后，未登录会返回401
@@ -765,9 +833,11 @@ INDEX_HTML = '''
                         addMessage('assistant', '❌ ' + (r.msg || '请求失败'));
                     } else {
                         const data = r.data || {};
-                        // Agent模式下先展示工具调用轨迹，再展示最终回答
-                        if (data.trace && data.trace.length > 0) {
-                            addToolTrace(data.trace);
+                        // Agent / 并行模式下先展示工具与知识库检索轨迹，再展示最终回答
+                        // （并行模式的检索概况即使没触发轨迹也要显示）
+                        if ((data.trace && data.trace.length > 0) ||
+                            (data.knowledge && (data.knowledge.retrievals || []).length > 0)) {
+                            addToolTrace(data.trace || [], data.knowledge);
                         }
                         addMessage('assistant', data.reply);
                     }
@@ -809,7 +879,17 @@ INDEX_HTML = '''
                 chatBox.scrollTop = chatBox.scrollHeight;
             }
 
-            function addToolTrace(trace) {
+            // 并行模式的知识库检索步骤（type=rag）单独排版：
+            // 结果里没存整段上下文，只说清"查了什么、命中没有、命中的哪个库"
+            function formatRagStep(step) {
+                const res = step.result || {};
+                if (res.error) return ' → ⚠️ ' + res.error;
+                if (!res.found) return ' → 未命中';
+                const source = res.collection ? '（' + res.collection + '）' : '';
+                return ' → 命中 ' + ((res.sources || []).length) + ' 段' + source;
+            }
+
+            function addToolTrace(trace, knowledge) {
                 const div = document.createElement('div');
                 div.className = 'tool-trace';
                 trace.forEach(step => {
@@ -817,14 +897,31 @@ INDEX_HTML = '''
                     p.className = 'tool-step';
                     const name = document.createElement('span');
                     name.className = 'tool-name';
-                    name.textContent = '🔧 ' + step.tool;
+                    const isRag = step.type === 'rag';
+                    name.textContent = (isRag ? '📚 ' : '🔧 ') + step.tool;
                     p.appendChild(name);
                     p.appendChild(document.createTextNode(
-                        ' (' + JSON.stringify(step.parameters) + ') → ' +
-                        JSON.stringify(step.result).slice(0, 120)
+                        ' (' + JSON.stringify(step.parameters) + ') → ' + (isRag
+                            ? formatRagStep(step)
+                            : JSON.stringify(step.result).slice(0, 120))
                     ));
                     div.appendChild(p);
                 });
+
+                // 并行模式的检索概况：预取（含没用上的）与按需补检索各花了多久
+                const rets = (knowledge && knowledge.retrievals) || [];
+                if (rets.length > 0) {
+                    const p = document.createElement('div');
+                    p.className = 'tool-step';
+                    p.style.color = '#888';
+                    p.textContent = '📚 知识库检索 ' + rets.length + ' 次：' +
+                        rets.map(r => (r.phase === 'prefetch' ? '预取' : '按需') +
+                            '「' + r.query + '」' +
+                            (r.found ? '命中' + r.chunks + '段' : '未命中') +
+                            ' ' + r.elapsed_ms + 'ms').join('；');
+                    div.appendChild(p);
+                }
+
                 chatBox.appendChild(div);
                 chatBox.scrollTop = chatBox.scrollHeight;
             }
@@ -1111,6 +1208,46 @@ def chat_with_llm(message, temperature, model=None):
         return f'调用LLM失败: {str(e)}'
 
 
+# ==================== 请求级解析助手（三种模式共用） ====================
+def _local_provider(model=None):
+    """把本地 Ollama 注册成 OpenAI 兼容 provider（key 仅占位，Ollama 不校验）"""
+    return {
+        "base_url": OLLAMA_V1,
+        "api_key": OLLAMA_API_KEY,
+        "model": model or _current_model,
+    }
+
+
+def _resolve_chat_provider(data):
+    """从请求体解析本次要用的模型配置（三种模式 / 两个聊天接口共用）。
+
+    Returns:
+        (provider, model, error)
+        provider 非 None = 外部模型；provider 为 None + model = 本地 Ollama；
+        error 为 (响应, 状态码) 元组，调用方直接 return 即可。
+    """
+    model = data.get('model') or MODEL_NAME
+    provider_id = data.get('provider_id')
+
+    # 走外部模型：先取本人配置（含完整api_key），取不到说明未登录/配置被删
+    if provider_id is not None:
+        uid = session.get('user_id')
+        if uid is None:
+            return None, model, err('使用外部模型需要先登录', 401)
+        provider = llm_provider_service.get_provider_by_id(provider_id, uid)
+        if provider is None:
+            return None, model, err('外部模型配置不存在，请重新选择或添加', 400)
+        return provider, model, None
+
+    # 本地模型变化时更新全局记录（Agent 本地侧单例在 get_agent 内按模型清理，
+    # RAG 生成按请求走 provider、无状态，均无需在此处理）
+    global _current_model
+    if model != _current_model:
+        _current_model = model
+        print(f"🔄 切换模型:{model}")
+    return None, model, None
+
+
 # ==================== RAG支持 ====================
 # 轻量单例只持有本地嵌入模型（检索用）；生成模型每次按前端选择走 provider、无状态，
 # 所以切换对话模型时无需像 Agent 那样重建本单例。
@@ -1179,10 +1316,14 @@ def get_agent(provider=None, model=None):
     return _agents[key]
 
 
-def chat_with_agent(message, provider=None, model=None, temperature=0.7):
+def chat_with_agent(message, provider=None, model=None, temperature=0.7,
+                    tool_packages=None):
     """
     使用Agent回答（支持天气/计算器/单位转换/搜索等工具调用）。
     模型与"直接对话"同构：provider 传外部配置走外部大模型，否则本地 Ollama。
+
+    Args:
+        tool_packages: 前端勾选的工具包名列表；None/空 = 全部启用
 
     Returns:
         (回答文本, 工具调用轨迹列表)
@@ -1190,7 +1331,7 @@ def chat_with_agent(message, provider=None, model=None, temperature=0.7):
     trace = []
     try:
         agent = get_agent(provider=provider, model=model)
-        reply = agent.chat(message, trace=trace)
+        reply = agent.chat(message, trace=trace, tool_packages=tool_packages)
         return reply, trace
 
     except Exception as e:
@@ -1202,6 +1343,48 @@ def chat_with_agent(message, provider=None, model=None, temperature=0.7):
             except Exception as e2:
                 return f'Agent调用失败: {e2}', trace
         return chat_with_llm(message, temperature, model), trace
+
+
+# ==================== Agent + RAG 并行模式 ====================
+def chat_with_agent_rag(message, provider=None, model=None, temperature=0.7,
+                        collection_names=None, tool_packages=None):
+    """Agent 与 RAG 并行：Agent 边思考边等知识库，不了解的先问知识库。
+
+    时序（并行发生在这里）：
+        1. 请求进来立刻开后台线程预取 —— 用原始问题跨库检索（未指定库则扫全部库）；
+        2. 同一时刻 Agent 开始首轮模型调用，不等检索结果；
+        3. Agent 中途遇到不了解的（要联网搜索 / 声明无法操作）时再取预取结果，
+           此时通常已就绪、零等待；预取没命中就当场按新关键词补检索。
+
+    Args:
+        collection_names: 要查的知识库名列表；空/None = 跨本机全部知识库
+        tool_packages: 前端勾选的工具包名列表；None/空 = 全部启用
+
+    Returns:
+        (回答文本, 工具调用轨迹, 检索概况)
+    """
+    trace = []
+    try:
+        from modules.rag.knowledge_bridge import PrefetchKnowledgeSource
+
+        # 第 1 步：先开预取线程（不阻塞），再拿 Agent 发起首轮调用（第 2 步）
+        rag = get_rag_service()
+        source = PrefetchKnowledgeSource(rag, collection_names=collection_names).start(message)
+        agent = get_agent(provider=provider, model=model)
+        reply = agent.chat(message, trace=trace, knowledge_getter=source.get,
+                           tool_packages=tool_packages)
+        return reply, trace, source.summary()
+
+    except Exception as e:
+        print(f"Agent+RAG并行错误: {e}")
+        # 降级：普通 Agent（知识库不可用不该让整个请求失败）
+        try:
+            reply, trace = chat_with_agent(message, provider=provider, model=model,
+                                           temperature=temperature)
+            return reply, trace, {"collections": [], "retrievals": [],
+                                  "error": f'知识库不可用，已降级为纯Agent模式: {e}'}
+        except Exception as e2:
+            return f'Agent+RAG调用失败: {e2}', trace, {"collections": [], "retrievals": []}
 
 
 # ==================== 应用工厂 ====================
@@ -1298,6 +1481,22 @@ def _register_inline_routes(app):
             'error': ollama_error,           # 可为 null：Ollama 拉取失败时的信息，不影响整体成功
         })
 
+    # ==================== 工具包列表 /api/agent/tools ====================
+    @app.route('/api/agent/tools', methods=['GET'])
+    def list_agent_tools():
+        """列出本机已安装的工具包（扫 data/agent_tools/*/manifest.json），供前端勾选。
+
+        返回 [{package, display_name, version, tools: [{name, description}]}]；
+        只读 manifest 元数据，不加载任何实现代码。扫描失败不报错，返回空列表 + error。
+        """
+        from modules.agent.tool_registry import ToolRegistry
+        try:
+            packages = ToolRegistry().get_package_overview()
+        except Exception as e:
+            print(f"⚠️ 读取工具包列表失败: {e}")
+            return ok({'tools': [], 'error': str(e)})
+        return ok({'tools': packages})
+
     # ==================== 知识库列表 /api/rag/collections ====================
     @app.route('/api/rag/collections', methods=['GET'])
     def list_rag_collections():
@@ -1375,45 +1574,34 @@ def _register_inline_routes(app):
     def chat():
         """聊天API
 
-        三种模式相互独立（后续要加的"并行模式"再统一编排），
-        模型选择对三种模式一致：本地 Ollama 或外部大模型（provider_id）皆可：
+        三种模式相互独立，模型选择对三种模式一致：
+        本地 Ollama 或外部大模型（provider_id）皆可：
           - rag：用前端指定的向量库（collection_name）检索，生成模型 = 前端当前所选
             （检索仍用本地嵌入模型）
           - agent：工具调用为提示词约定的JSON协议，不依赖原生 function calling，
-            本地与外部大模型走同一代码路径
+            本地与外部大模型走同一代码路径；tool_packages 指定启用的工具包
+            （不传/空 = 全部，列表见 /api/agent/tools）
           - llm 直接对话：统一 OpenAI 兼容调用
+
+        Agent 与 RAG 并行的编排见 /api/chat/parallel。
         """
-        global _current_model
         try:
-            data = request.json
+            data = request.json or {}
             message = data.get('message', '')
             mode = data.get('mode', 'agent')  # agent / rag / llm
             temperature = data.get('temperature', 0.7)
-            model = data.get('model') or MODEL_NAME
-            # 外部模型：前端选了 "ext:<id>" 时携带 provider_id，优先级高于本地model
-            provider_id = data.get('provider_id')
 
-            # 走外部模型：先取本人配置（含完整api_key），取不到说明未登录/配置被删。
-            # 三种模式（agent/rag/llm）均可用外部模型。
-            provider = None
-            if provider_id is not None:
-                uid = session.get('user_id')
-                if uid is None:
-                    return err('使用外部模型需要先登录', 401)
-                provider = llm_provider_service.get_provider_by_id(provider_id, uid)
-                if provider is None:
-                    return err('外部模型配置不存在，请重新选择或添加', 400)
-
-            # 本地模型变化时更新全局记录（Agent 本地侧单例在 get_agent 内按模型清理，
-            # RAG 生成按请求走 provider、无状态，均无需在此处理）
-            if provider is None and model != _current_model:
-                _current_model = model
-                print(f"🔄 切换模型:{model}")
+            # 模型解析（外部 provider_id 优先，否则本地）；失败直接返回错误响应
+            provider, model, error = _resolve_chat_provider(data)
+            if error:
+                return error
 
             if not message:
                 return err('请输入问题', 400)
 
             # 根据前端选择的模式分发
+            tool_packages = data.get('tool_packages')  # 勾选的工具包；None/空 = 全部
+
             if mode == 'rag':
                 # 用哪个向量库（知识库）由前端参数决定，例：文档上传后返回的 collection_name
                 collection_name = (data.get('collection_name') or '').strip()
@@ -1424,18 +1612,15 @@ def _register_inline_routes(app):
                     return err(f'知识库「{collection_name}」不存在，请先上传文档或改选其它知识库', 404)
                 # 生成模型：外部优先；未选外部则把本地 Ollama 注册成 /v1 provider（同直接对话）
                 if provider is None:
-                    provider = {
-                        "base_url": OLLAMA_V1,
-                        "api_key": OLLAMA_API_KEY,
-                        "model": model,
-                    }
+                    provider = _local_provider(model)
                 reply = chat_with_rag(message, provider, collection_name, temperature)
                 return ok({'reply': reply})
 
             if mode == 'agent':
                 # 模型与直接对话同构：外部传 provider，本地传 model
                 reply, trace = chat_with_agent(message, provider=provider, model=model,
-                                               temperature=temperature)
+                                               temperature=temperature,
+                                               tool_packages=tool_packages)
                 return ok({'reply': reply, 'trace': trace})
 
             # 默认直接对话：本地与外部统一走 chat_openai_compatible()
@@ -1446,6 +1631,66 @@ def _register_inline_routes(app):
             else:
                 reply = chat_with_llm(message, temperature)
             return ok({'reply': reply})
+
+        except Exception as e:
+            return err(str(e), 500)
+
+    # ==================== 并行模式 /api/chat/parallel ====================
+    @app.route('/api/chat/parallel', methods=['POST'])
+    def chat_parallel():
+        """Agent + RAG 并行模式：Agent 边思考边查知识库，不了解的先问知识库。
+
+        与 /api/chat 的区别只在编排，不在模型选择 —— 本地 Ollama / 外部模型
+        都走同一套 provider 解析（_resolve_chat_provider）。
+
+        请求体（在 /api/chat 基础上去掉了 mode）：
+            {
+              "message": "...",              # 必填
+              "temperature": 0.7,
+              "model": "llama3.2:1b",        # 本地模型（provider_id 非空时忽略）
+              "provider_id": 3,              # 外部模型配置 id（需登录）
+              "collection_name": "公司制度",  # 可选：只查这个库；
+                                             #   不传/空 = 跨本机全部知识库检索
+              "tool_packages": ["weather"]   # 可选：启用的工具包（前端勾选）；
+                                             #   不传/空 = 全部工具包
+            }
+
+        成功 data：
+            {
+              "reply": "回答文本",
+              "trace": [ {tool, type?, parameters, result} ],
+                 # 知识库检索记为 tool="rag_search"、type="rag"，
+                 # 前端用 type 区分"📚 知识库"与"🔧 工具"
+              "knowledge": {
+                 "collections": ["kb-xxx"],   # 实际查的库；未指定时为扫过的全部库
+                 "retrievals": [ {phase, query, collection, found, chunks, elapsed_ms} ]
+                 # phase：prefetch=请求入口预取 / ondemand=Agent 中途按需补检索
+                 # 含未被用到的预取 —— 预取本就是"先算好、可能用不上"
+              }
+            }
+        """
+        try:
+            data = request.json or {}
+            message = (data.get('message') or '').strip()
+            temperature = data.get('temperature', 0.7)
+            # 未指定知识库时跨全部库检索（空串按未指定处理）
+            collection_name = (data.get('collection_name') or '').strip()
+            # 勾选的工具包；None/空 = 全部启用（与 /api/chat 一致）
+            tool_packages = data.get('tool_packages')
+
+            provider, model, error = _resolve_chat_provider(data)
+            if error:
+                return error
+
+            if not message:
+                return err('请输入问题', 400)
+
+            reply, trace, knowledge = chat_with_agent_rag(
+                message, provider=provider, model=model, temperature=temperature,
+                collection_names=[collection_name] if collection_name else None,
+                tool_packages=tool_packages,
+            )
+            return ok({'reply': reply, 'trace': trace, 'knowledge': knowledge})
 
         except Exception as e:
             return err(str(e), 500)

@@ -109,6 +109,33 @@ class RAGService:
         )
 
     # ==================== 检索 ====================
+    def retrieve_scored(self, collection_name: str, query: str, k: int = DEFAULT_K) -> list:
+        """按距离阈值检索，返回 [(文档, 距离)]（距离越小越相似，已过滤超阈值项）。
+
+        与 retrieve() 的区别：不抛异常。并行模式会跨库盲扫，单个库读不了
+        （不存在/空库/文件损坏）不该让整轮检索失败，一律按"这个库没查到"处理。
+        """
+        try:
+            if not self.collection_exists(collection_name):
+                return []
+            vectorstore = self._load_vectorstore(collection_name)
+            if vectorstore._collection.count() == 0:
+                return []
+            results = vectorstore.similarity_search_with_score(query, k=k)
+        except Exception as e:
+            print(f"⚠️ 检索知识库 {collection_name} 失败: {e}")
+            return []
+
+        if results:
+            best_distance = results[0][1]
+            print(f"📏 [{collection_name}] 最佳检索距离: "
+                  f"{best_distance:.4f}（阈值: {self.distance_threshold}）")
+
+        return [
+            (doc, distance) for doc, distance in results
+            if distance <= self.distance_threshold
+        ]
+
     def retrieve(self, collection_name: str, query: str, k: int = DEFAULT_K):
         """按距离阈值检索，返回 (是否命中知识库, 命中文档列表)
 
@@ -118,20 +145,35 @@ class RAGService:
         if not self.collection_exists(collection_name):
             raise ValueError(f"知识库（向量库）不存在: {collection_name}")
 
-        vectorstore = self._load_vectorstore(collection_name)
-        if vectorstore._collection.count() == 0:
-            return False, []
+        scored = self.retrieve_scored(collection_name, query, k=k)
+        return (len(scored) > 0), [doc for doc, _ in scored]
 
-        results = vectorstore.similarity_search_with_score(query, k=k)
-        if results:
-            best_distance = results[0][1]
-            print(f"📏 最佳检索距离: {best_distance:.4f}（阈值: {self.distance_threshold}）")
+    def retrieve_multi(self, collection_names, query: str, k: int = DEFAULT_K):
+        """跨多个知识库检索，取"最优库"的结果。
 
-        docs = [
-            doc for doc, distance in results
-            if distance <= self.distance_threshold
-        ]
-        return (len(docs) > 0), docs
+        Agent 不知道答案在哪个库（甚至不知道有哪些库），并行模式用它在全部库里找。
+        哪个库的最佳距离最小就用哪个库 —— 不混拼多个库的片段，来源可追溯。
+
+        Returns:
+            (是否命中, 命中文档列表, 命中的库名)；未命中时库名为 None
+        """
+        best = None  # (最佳距离, 库名, [(文档, 距离)])
+        for name in collection_names or []:
+            scored = self.retrieve_scored(name, query, k=k)
+            if not scored:
+                continue
+            distance = min(d for _, d in scored)
+            if best is None or distance < best[0]:
+                best = (distance, name, scored)
+
+        if best is None:
+            return False, [], None
+        _, name, scored = best
+        return True, [doc for doc, _ in scored], name
+
+    def retrieve_all(self, query: str, k: int = DEFAULT_K):
+        """跨本机全部知识库检索（并行模式未指定库时用）"""
+        return self.retrieve_multi(self.list_collections(), query, k=k)
 
     # ==================== 问答 ====================
     def ask(self, collection_name: str, question: str, generate, k: int = DEFAULT_K) -> dict:

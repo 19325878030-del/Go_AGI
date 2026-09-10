@@ -1,5 +1,6 @@
 {
   "package": "calculator",
+  "display_name": "计算器与单位转换",
   "version": "1.0.0",
   "entry_module": "implementation.py",
   "tools": [

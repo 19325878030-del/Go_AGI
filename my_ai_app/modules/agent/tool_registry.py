@@ -5,6 +5,7 @@
 # manifest.json 契约（以 weather 包为例）：
 # {
 #   "package": "weather",          # 包名（=目录名）
+#   "display_name": "天气查询",     # 可选：前端工具包勾选列表用的显示名，缺省用包名
 #   "version": "1.0.0",            # 语义化版本，加载器据此判断缓存是否过期
 #   "entry_module": "implementation.py",   # 实现文件（相对包目录）
 #   "tools": [
@@ -23,7 +24,7 @@
 # }
 import json
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 # 工具包根目录：my_ai_app/data/agent_tools/
 # （本文件位于 my_ai_app/modules/agent/ 下，向上三级到应用根）
@@ -101,19 +102,63 @@ class ToolRegistry:
 
             self._packages[pkg_dir.name] = manifest
 
-    def get_schemas(self) -> Dict[str, Dict]:
+    def get_schemas(self, tool_packages: Optional[List[str]] = None) -> Dict[str, Dict]:
         """
-        返回全部工具的 Schema，供构建系统提示：
+        返回工具的 Schema，供构建系统提示：
         {工具名: {"description": ..., "parameters": ...}}
+
+        tool_packages 非空时只返回这些包里的工具（前端按工具包勾选）；
+        None/空列表 = 全部注册的工具。包名先经 resolve_package_names 归一化。
         """
+        resolved = self.resolve_package_names(tool_packages)
+        if resolved is None:
+            return {name: {"description": info["description"], "parameters": info["parameters"]}
+                    for name, info in self._tools.items()}
+        wanted = set(resolved)
         return {
             name: {"description": info["description"], "parameters": info["parameters"]}
             for name, info in self._tools.items()
+            if info["package"] in wanted
         }
 
     def get_tool_info(self, tool_name: str) -> Optional[Dict]:
         """查某个工具由哪个包/入口函数提供；未知工具返回 None"""
         return self._tools.get(tool_name)
+
+    def resolve_package_names(self, tool_packages: Optional[List[str]]) -> Optional[List[str]]:
+        """把前端传来的包名列表归一化成合法包名。
+
+        display_name（显示名）与 package（包名）都能识别；未知名字直接丢弃。
+        返回 None 表示"不过滤"（入参 None/空 = 全部包），空列表表示
+        "过滤后一个包都不剩"——两层语义不同，调用方要区分对待。
+        """
+        if not tool_packages:
+            return None
+        by_display = self.get_package_overview()
+        display_map = {p["display_name"]: p["package"] for p in by_display}
+        resolved = []
+        for name in tool_packages:
+            pkg = name if name in self._packages else display_map.get(name)
+            if pkg and pkg not in resolved:
+                resolved.append(pkg)
+        return resolved
+
+    def get_package_overview(self) -> List[Dict]:
+        """工具包概览，供前端勾选列表（GET /api/agent/tools）：
+        [{package, display_name, version, tools: [{name, description}]}]
+        """
+        overview = []
+        for pkg_name, manifest in self._packages.items():
+            overview.append({
+                "package": pkg_name,
+                "display_name": manifest.get("display_name") or pkg_name,
+                "version": manifest.get("version", ""),
+                "tools": [
+                    {"name": t.get("name", ""), "description": t.get("description", "")}
+                    for t in manifest.get("tools", [])
+                ],
+            })
+        return overview
 
     def get_fallback_helper(self) -> Optional[Dict]:
         """

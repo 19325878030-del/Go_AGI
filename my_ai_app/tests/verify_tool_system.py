@@ -1,11 +1,12 @@
 # 验证：工具元数据注册表 + 按需动态加载（不依赖 Ollama/网络）
 # 运行: python tests/verify_tool_system.py
 #
-# 验证四件事：
+# 验证五件事：
 #   1. 注册表扫出 5 个工具 Schema（weather/calculator/web_search 三包）
 #   2. 惰性加载：拿到 Schema 后、调用前，实现模块尚未导入
 #   3. 动态加载后工具执行正确（calculator 单元换算/表达式、判空辅助函数）
 #   4. 二次调用命中缓存（加载器 loaded_packages 不再增长、同一函数对象）
+#   5. 工具包概览与按包过滤（前端勾选：display_name 展示、get_schemas 只含启用包）
 import sys
 sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 sys.path.insert(0, r'D:\Go_AGI')
@@ -63,6 +64,23 @@ def main():
     assert calculator_again is calculator, '二次调用返回了不同对象，缓存未命中'
     assert len(loader.loaded_packages) == n_before, '包被重复加载'
     print(f'✅ 4) 二次调用命中缓存（已加载包: {loader.loaded_packages}）')
+
+    # ---- 5) 工具包概览与按包过滤（前端勾选） ----
+    overview = registry.get_package_overview()
+    assert {p['package'] for p in overview} == {'weather', 'calculator', 'web_search'}
+    by_pkg = {p['package']: p for p in overview}
+    assert by_pkg['weather']['display_name'] == '天气查询'      # manifest 的 display_name
+    assert by_pkg['calculator']['display_name'] == '计算器与单位转换'
+    assert {t['name'] for t in by_pkg['weather']['tools']} == {'get_weather', 'get_forecast'}
+
+    # get_schemas 按包过滤：只勾 weather 时只剩天气两个工具
+    assert set(registry.get_schemas(['weather']).keys()) == {'get_weather', 'get_forecast'}
+    # 不传/空 = 全部（None 语义）
+    assert set(registry.get_schemas(None).keys()) == expected
+    # display_name 也能解析到包名；未知名字被丢弃
+    assert registry.resolve_package_names(['天气查询', '不存在的包']) == ['weather']
+    assert registry.resolve_package_names(None) is None
+    print(f'✅ 5) 包概览/按包过滤/display_name 解析正确（{len(overview)} 个包）')
 
     print('\n全部验证通过 ✅')
 
